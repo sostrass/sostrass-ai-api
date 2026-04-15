@@ -1,0 +1,55 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ========================================
+  AJUSTES NATIVOS (Para parecer um App)
+  ========================================
+*/
+body {
+  background-color: #000000;
+  color: #ffffff;
+  /* Evita que a tela "quique" no scroll em navegadores mobile */
+  overscroll-behavior-y: none; 
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Esconde a barra de rolagem (Scrollbar invisível) */
+::-webkit-scrollbar {
+  display: none;
+}
+* {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@layer components {
+  /* ========================================
+    EFEITO GLASSMORPHISM (Estilo Central de Controle iOS)
+    ========================================
+  */
+  .glass-panel {
+    @apply bg-[#1C1C1E]/60 backdrop-blur-xl border border-white/10 shadow-2xl;
+  }
+
+  /* ========================================
+    SKELETON LOADING (Quando a IA está digitando)
+    ========================================
+  */
+  .skeleton-box {
+    @apply relative overflow-hidden bg-[#1C1C1E] rounded-xl;
+  }
+  
+  .skeleton-box::after {
+    content: "";
+    @apply absolute inset-0 -translate-x-full;
+    background-image: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0) 0,
+      rgba(255, 255, 255, 0.05) 20%,
+      rgba(255, 255, 255, 0.1) 60%,
+      rgba(255, 255, 255, 0)
+    );
+    animation: shimmer 2s infinite;
+  }
+}
