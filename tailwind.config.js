@@ -7,20 +7,13 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Paleta oficial do iOS Dark Mode
         ios: {
-          bg: '#000000',           // Fundo principal
-          card: '#1C1C1E',         // Fundo de cards sólidos
-          gray: '#8E8E93',         // Textos secundários
-          blue: '#0A84FF',         // Botões primários Apple
-          separator: '#38383A',    // Linhas divisórias
-        },
-        shopee: {
-          orange: '#EE4D2D',       // Pra manter a identidade da origem
+          bg: '#000000',
+          card: '#1C1C1E',
+          blue: '#0A84FF',
         }
       },
       animation: {
-        // Animação suave para quando a IA estiver pensando
         shimmer: 'shimmer 2s linear infinite',
       },
       keyframes: {
