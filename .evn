@@ -1,2 +1,5 @@
-PORT=3000
-GEMINI_API_KEY=cole_sua_chave_do_google_aqui
+PORT=4000
+SHOPEE_PARTNER_ID=seu_partner_id_gerado_no_painel
+SHOPEE_PARTNER_KEY=sua_partner_key_gigante_aqui
+SHOP_ID=seu_id_de_loja_aqui
+ACCESS_TOKEN=seu_token_de_acesso_aqui
