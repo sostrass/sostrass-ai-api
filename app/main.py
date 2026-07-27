@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v5.1 — boot OK · dados fiscais ML (motivo) + geração NF-e · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v5.3 — boot OK · diag geração NF-e ponta a ponta · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3518,20 +3518,24 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             fee = fee_u * qty
             mr = precificacao.margem_real_canal(_pcfg, "mercadolivre", unit, custo_prod) or {}
             liq_u = mr.get("liquido")
-            liq_item = (liq_u * qty) if liq_u is not None else (rev - fee)
+            liq_cfg_item = (liq_u * qty) if liq_u is not None else (rev - fee)
+            liq_item = rev - fee   # REAL: preço pago − tarifa que o ML cobrou (sale_fee)
             itens.append({
                 "item_id": iid or None, "sku": sku or None, "titulo": titulo,
                 "imagem": imagem, "quantidade": qty, "unit_price": round(unit, 2),
                 "sale_fee": round(fee, 2), "preco_bling": preco_bling, "custo": custo_prod,
                 "ml_preco": ml_preco, "receita": round(rev, 2),
-                "liquido": round(liq_item, 2), "taxas_mkt": round((mr.get("taxas") or 0) * qty, 2) or None,
-                "lucro": round(mr["lucro"] * qty, 2) if mr.get("lucro") is not None else None,
-                "margem": mr.get("margem_pct"),
+                "liquido": round(liq_item, 2),          # real (receita − sale_fee)
+                "taxas_mkt": round(fee, 2),             # o que o ML cobrou de fato
+                "taxas_cfg": round((mr.get("taxas") or 0) * qty, 2) or None,   # estimativa da tabela
+                "liquido_cfg": round(liq_cfg_item, 2),                          # líquido estimado
+                "lucro": round(liq_item - (custo_prod or 0) * qty, 2) if custo_prod else None,
+                "margem": round(liq_item / rev * 100, 1) if rev > 0 else None,
             })
             o_rec += rev; o_fee += fee; o_bling += (preco_bling or 0) * qty; o_unid += qty
             o_taxas_cfg += (mr.get("taxas") or 0) * qty
-            o_liq_cfg += liq_item
-        o_liq = o_liq_cfg
+            o_liq_cfg += liq_cfg_item
+        o_liq = o_rec - o_fee   # REAL (o frete entra depois, quando o cache de envios é lido)
         st = o.get("status")
         por_status[st] = por_status.get(st, 0) + 1
         dia = (o.get("date_created") or "")[:10]
@@ -3585,11 +3589,14 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
             "itens": itens,
             "resumo": {
                 "receita": round(o_rec, 2),
-                "tarifa": round(o_fee, 2),  # comissão REAL cobrada pelo ML (sale_fee) — informativo
-                "taxas": round(o_taxas_cfg, 2),  # taxas pela Configuração (faixa + imposto + cartão + embalagem)
+                "tarifa": round(o_fee, 2),  # comissão REAL cobrada pelo ML (sale_fee)
+                "taxas_cfg": round(o_taxas_cfg, 2),  # ESTIMATIVA da sua tabela (faixa+imposto+cartão) — comparação, não cobrança
+                "liquido_cfg": round(o_liq_cfg, 2),  # líquido pela estimativa (planejamento)
                 "preco_bling": round(o_bling, 2) if o_bling else None,  # alvo: quanto deve sobrar
-                "liquido": round(o_liq, 2), "unidades": o_unid, "estornado": (st == "cancelled"),
-                "margem": round(o_liq / o_rec * 100, 1) if o_rec > 0 else None,
+                # CONTA REAL (igual ao extrato do ML): receita − sale_fee − frete do vendedor.
+                # O frete entra logo abaixo, quando o cache de envios é lido.
+                "liquido": round(o_rec - o_fee, 2), "unidades": o_unid, "estornado": (st == "cancelled"),
+                "margem": round((o_rec - o_fee) / o_rec * 100, 1) if o_rec > 0 else None,
             },
         })
         t_rec += o_rec; t_fee += o_fee; t_cost += o_taxas_cfg; t_liq += o_liq; t_unid += o_unid
@@ -3655,14 +3662,14 @@ def _pedidos_ml_enriquecidos(ml, user_id, status, offset, limit, desde=None, ate
         baldes[balde] = baldes.get(balde, 0) + 1
         r = p.get("resumo") or {}
         frete = float((env or {}).get("custo_vendedor") or 0) if env else 0.0
-        # A tarifa (comissão via sale_fee) já vem do pedido; somamos o frete pago pelo
-        # vendedor (frete grátis sai do bolso do vendedor) p/ a margem ficar exata.
-        r["frete_vendedor"] = round(frete, 2) if frete else 0.0
+        # CONTA REAL DO CANAL (espelha o extrato do ML):
+        #   receita − tarifa de venda (sale_fee) − frete por conta do vendedor = líquido
+        # A estimativa da tabela de preços fica em taxas_cfg/liquido_cfg, para comparação.
+        r["frete_vendedor"] = round(frete, 2)
         r["tarifa_total"] = round((r.get("tarifa") or 0) + frete, 2)
         r["comissao_pct"] = round((r.get("tarifa") or 0) / r["receita"] * 100, 1) if r.get("receita") else None
-        if frete:
-            r["liquido"] = round((r.get("liquido") or 0) - frete, 2)
-            r["margem"] = round(r["liquido"] / r["receita"] * 100, 1) if r.get("receita") else None
+        r["liquido"] = round((r.get("receita") or 0) - (r.get("tarifa") or 0) - frete, 2)
+        r["margem"] = round(r["liquido"] / r["receita"] * 100, 1) if r.get("receita") else None
         p["resumo"] = r
         t_frete += frete
         if env:
@@ -3899,8 +3906,6 @@ def ml_dados_fiscais_ep(payload: dict = Body(default={}), user: User = Depends(a
             mapa[oid] = d
     ths = []
     for oid in ids:
-        with _ML_SEM:
-            pass
         th = _t.Thread(target=_um, args=(oid,), daemon=True); th.start(); ths.append(th)
         if len(ths) >= 6:
             for t in ths: t.join(timeout=15)
@@ -3909,10 +3914,76 @@ def ml_dados_fiscais_ep(payload: dict = Body(default={}), user: User = Depends(a
     return {"mapa": mapa}
 
 
+@app.get("/api/nfe/_diag_gerar")
+def diag_gerar_nfe(order_id: str = "", user: User = Depends(auth.get_current_user)):
+    """Roda o fluxo COMPLETO de geração para 1 pedido, mostrando cada etapa.
+    Sem order_id, escolhe sozinho um pedido do cache que ainda não tem nota."""
+    from . import mercadolivre as ml, nfe_gerar
+    out = {"passos": []}
+    try:
+        # 1) escolher o pedido
+        if not order_id:
+            from .models import MLPedidoCache as _MP
+            _db = SessionLocal()
+            row = (_db.query(_MP).filter(_MP.user_id == user.id, _MP.raw.isnot(None))
+                   .order_by(_MP.date_created.desc()).first())
+            _db.close()
+            if row is None:
+                out["passos"].append("nenhum pedido no cache — carregue o painel primeiro")
+                return out
+            order_id = str(row.order_id)
+            raw = row.raw or {}
+        else:
+            raw = ml.pedido(order_id, user.id) if hasattr(ml, "pedido") else {}
+        out["order_id"] = order_id
+        out["passos"].append(f"1) pedido escolhido: {order_id}")
+
+        # 2) itens do pedido
+        itens = []
+        for it in ((raw or {}).get("order_items") or []):
+            i = it.get("item") or {}
+            itens.append({"sku": i.get("seller_sku") or i.get("seller_custom_field") or i.get("id"),
+                          "descricao": i.get("title"), "quantidade": it.get("quantity") or 1,
+                          "valor": it.get("unit_price") or 0})
+        out["passos"].append(f"2) itens montados: {len(itens)} — {[x['sku'] for x in itens][:3]}")
+
+        # 3) dados fiscais do comprador (billing_info)
+        df = ml.dados_fiscais_comprador(order_id, user.id)
+        out["billing_info"] = df
+        out["passos"].append(f"3) billing_info: ok={df.get('ok')} nome={df.get('nome')} "
+                             f"doc={df.get('doc_tipo')} {df.get('doc_numero')} erro={df.get('erro')}")
+
+        # 4) montar o pedido no formato da geração
+        pedido = {
+            "numero_loja": order_id,
+            "cliente": {"nome": df.get("nome"), "cpf_cnpj": df.get("doc_numero"),
+                        "endereco": {"completo": df.get("endereco"), "bairro": df.get("bairro"),
+                                     "cidade": df.get("cidade"), "uf": df.get("estado"), "cep": df.get("cep")}},
+            "itens": itens,
+        }
+        out["passos"].append("4) pedido montado para a NF-e")
+
+        # 5) molde
+        molde = nfe_gerar._molde(user.id)
+        out["passos"].append(f"5) molde: {'ENCONTRADO nº ' + str(molde.get('numero')) if molde else 'NENHUM — gere 1 nota no Bling'}")
+
+        # 6) dry-run (NÃO gera nada)
+        r = nfe_gerar.gerar(user.id, pedido, molde=molde, dry_run=True)
+        out["dry_run"] = r
+        out["passos"].append(f"6) dry-run: ok={r.get('ok')} erro={r.get('erro')}")
+        out["veredito"] = ("PRONTO PARA GERAR" if r.get("ok")
+                           else f"BLOQUEADO: {r.get('erro')}")
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        out["passos"].append(f"ERRO: {type(e).__name__}: {str(e)[:200]}")
+        out["trace"] = traceback.format_exc()[-500:]
+    return out
+
+
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v5.1", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v5.3", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
