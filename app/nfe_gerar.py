@@ -39,9 +39,24 @@ def _molde(user_id: int, dias: int = 90) -> dict | None:
     autorizadas = [x for x in linhas if str(x.get("situacao") or "").lower() in ("autorizada", "5", "authorized")]
     alvo = (autorizadas or linhas)[0]
     try:
-        return bling.obter_nfe(user_id, alvo.get("id"))
+        raw = bling.obter_nfe(user_id, alvo.get("id"))
     except Exception:  # noqa: BLE001
         return None
+    # o Bling v3 devolve {"data": {...}} — sem desembrulhar, naturezaOperacao/loja somem
+    return raw.get("data", raw) if isinstance(raw, dict) else None
+
+
+def _rua_numero(completo: str, numero=None):
+    """Separa logradouro e número. A NF-e exige campos distintos (xLgr / nro):
+    "Rua Genebaldo Figueiredo 44" -> ("Rua Genebaldo Figueiredo", "44")."""
+    import re
+    txt = str(completo or "").strip()
+    if numero:
+        return txt or "", str(numero)
+    m = re.search(r"^(.*?)[,\s]+(\d+[A-Za-z]?)\s*$", txt)
+    if m:
+        return m.group(1).strip(" ,-"), m.group(2)
+    return txt, "S/N"
 
 
 def _so_digitos(v) -> str:
@@ -75,9 +90,10 @@ def montar_corpo(molde: dict, pedido: dict) -> dict:
     if cli.get("email"):
         contato["email"] = cli["email"]
     if end:
+        rua, num = _rua_numero(end.get("completo") or end.get("logradouro") or "", end.get("numero"))
         contato["endereco"] = {
-            "endereco": end.get("completo") or end.get("logradouro") or "",
-            "numero": str(end.get("numero") or "S/N"),
+            "endereco": rua,
+            "numero": num,
             "bairro": end.get("bairro") or "",
             "cep": _so_digitos(end.get("cep")),
             "municipio": end.get("cidade") or "",
@@ -138,7 +154,10 @@ def gerar(user_id: int, pedido: dict, molde: dict | None = None, dry_run: bool =
     if not (corpo.get("contato") or {}).get("numeroDocumento"):
         faltas.append("sem CPF/CNPJ do destinatário")
     if not corpo.get("naturezaOperacao") and not corpo.get("loja"):
-        faltas.append("molde sem natureza de operação/loja")
+        faltas.append("o molde não trouxe natureza de operação nem loja — "
+                      "confira se a nota usada de molde está completa no Bling")
+    if not (corpo.get("contato") or {}).get("endereco", {}).get("municipio"):
+        faltas.append("sem cidade/UF do destinatário")
     if faltas:
         return {"ok": False, "erro": "não gerei: " + ", ".join(faltas), "corpo": corpo}
 

@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v5.3 — boot OK · diag geração NF-e ponta a ponta · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v5.4 — boot OK · molde desembrulhado + endereço do envio · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -3864,6 +3864,49 @@ def nfe_gerar_ep(payload: dict = Body(default={}), user: User = Depends(auth.get
     if not pedido:
         return {"ok": False, "erro": "envie 'pedido' com cliente e itens."}
     dry = payload.get("dry_run", True)
+    # ENRIQUECIMENTO DO DESTINATÁRIO (servidor): o billing_info do ML traz o CPF mas nem
+    # sempre o endereço. Completamos com o endereço de ENTREGA do envio, que é o que vai
+    # na NF-e. Sem isto a nota sai com destinatário incompleto e o Sefaz rejeita.
+    try:
+        cli = pedido.setdefault("cliente", {})
+        end = cli.setdefault("endereco", {})
+        oid = str(pedido.get("numero_loja") or "")
+        if oid and not (end.get("cidade") and end.get("completo")):
+            from . import mercadolivre as ml
+            if not cli.get("cpf_cnpj") or not end.get("cidade"):
+                try:
+                    df = ml.dados_fiscais_comprador(oid, user.id) or {}
+                    if df.get("ok"):
+                        cli["nome"] = cli.get("nome") or df.get("nome")
+                        cli["cpf_cnpj"] = cli.get("cpf_cnpj") or df.get("doc_numero")
+                        for k_src, k_dst in (("endereco", "completo"), ("bairro", "bairro"),
+                                             ("cidade", "cidade"), ("estado", "uf"), ("cep", "cep")):
+                            if df.get(k_src) and not end.get(k_dst):
+                                end[k_dst] = df[k_src]
+                except Exception:  # noqa: BLE001
+                    pass
+            # ainda sem cidade? usa o endereço de ENTREGA do cache de envios
+            if not end.get("cidade"):
+                try:
+                    from .models import MLPedidoCache as _MP, MLEnvioCache as _ME
+                    _db = SessionLocal()
+                    row = _db.query(_MP).filter(_MP.user_id == user.id, _MP.order_id == oid).first()
+                    ship_id = None
+                    if row is not None and (row.raw or {}):
+                        ship_id = str(((row.raw or {}).get("shipping") or {}).get("id") or "")
+                    env = (_db.query(_ME).filter(_ME.user_id == user.id, _ME.shipment_id == ship_id).first()
+                           if ship_id else None)
+                    if env is not None:
+                        end["completo"] = end.get("completo") or env.receiver_endereco
+                        end["cidade"] = end.get("cidade") or env.receiver_cidade
+                        end["uf"] = end.get("uf") or env.receiver_estado
+                        end["cep"] = end.get("cep") or env.receiver_cep
+                        cli["nome"] = cli.get("nome") or env.receiver_nome
+                    _db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
     try:
         return nfe_gerar.gerar(user.id, pedido, dry_run=bool(dry))
     except Exception as e:  # noqa: BLE001
@@ -3983,7 +4026,7 @@ def diag_gerar_nfe(order_id: str = "", user: User = Depends(auth.get_current_use
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v5.3", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v5.4", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
