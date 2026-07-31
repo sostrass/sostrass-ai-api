@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v5.4 — boot OK · molde desembrulhado + endereço do envio · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v5.5 — boot OK · Prova de Expedição (dossiê + cadeia de hash) · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -4023,10 +4023,148 @@ def diag_gerar_nfe(order_id: str = "", user: User = Depends(auth.get_current_use
     return out
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PROVA DE EXPEDIÇÃO — Mesa de Separação (mockup v3 aprovado)
+# ═══════════════════════════════════════════════════════════════════════════
+@app.post("/api/separacao/abrir")
+def sep_abrir(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """A bipagem da etiqueta chama isto: abre a sessão e a gravação começa."""
+    from . import separacao as sp
+    db = SessionLocal()
+    try:
+        s = sp.abrir(db, user.id, payload.get("pedido") or {},
+                     bancada=payload.get("bancada") or "Bancada 1",
+                     operador=payload.get("operador"),
+                     qualidade=payload.get("qualidade") or "padrao")
+        return {"ok": True, "sessao": sp.resumo(s)}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": f"{type(e).__name__}: {str(e)[:200]}"}
+    finally:
+        db.close()
+
+
+@app.post("/api/separacao/{sessao_id}/take")
+def sep_take(sessao_id: int, payload: dict = Body(default={}),
+             user: User = Depends(auth.get_current_user)):
+    """Recebe o take já com a marca queimada pelo navegador (dataURL base64)."""
+    from . import separacao as sp
+    import base64
+    db = SessionLocal()
+    try:
+        b64 = str(payload.get("imagem") or "")
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+        dados = base64.b64decode(b64) if b64 else b""
+        m = sp.add_take(db, user.id, sessao_id, dados,
+                        passo=payload.get("passo") or "avulso",
+                        modo=payload.get("modo") or "auto",
+                        gatilho=payload.get("gatilho"),
+                        largura=payload.get("largura"), altura=payload.get("altura"))
+        return {"ok": True, "take": {"id": m.id, "ordem": m.ordem, "passo": m.passo,
+                                     "kb": round(m.bytes / 1024, 1), "sha256": m.sha256,
+                                     "hash_elo": m.hash_elo, "url": f"/api/separacao/midia/{m.id}"}}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": f"{type(e).__name__}: {str(e)[:200]}"}
+    finally:
+        db.close()
+
+
+@app.post("/api/separacao/{sessao_id}/evento")
+def sep_evento(sessao_id: int, payload: dict = Body(default={}),
+               user: User = Depends(auth.get_current_user)):
+    """Bipagem de SKU, tique manual, divergência — tudo entra na linha do tempo."""
+    from . import separacao as sp
+    db = SessionLocal()
+    try:
+        e = sp.evento(db, user.id, sessao_id, payload.get("tipo") or "evento",
+                      descricao=payload.get("descricao"), sku=payload.get("sku"),
+                      dados=payload.get("dados"))
+        return {"ok": True, "id": e.id}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": str(e)[:200]}
+    finally:
+        db.close()
+
+
+@app.post("/api/separacao/{sessao_id}/selar")
+def sep_selar(sessao_id: int, payload: dict = Body(default={}),
+              user: User = Depends(auth.get_current_user)):
+    """Sela o dossiê. Sem os 5 passos do roteiro, NÃO sela."""
+    from . import separacao as sp
+    db = SessionLocal()
+    try:
+        return sp.selar(db, user.id, sessao_id, forcar=bool(payload.get("forcar")))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": str(e)[:200]}
+    finally:
+        db.close()
+
+
+@app.get("/api/separacao/midia/{midia_id}")
+def sep_midia(midia_id: int, user: User = Depends(auth.get_current_user)):
+    """Serve a imagem do take (com a marca já queimada)."""
+    from .models import SepMidia
+    db = SessionLocal()
+    try:
+        m = (db.query(SepMidia)
+             .filter(SepMidia.user_id == user.id, SepMidia.id == midia_id).first())
+        if m is None or not m.dados:
+            raise HTTPException(status_code=404, detail="take não encontrado")
+        return Response(content=m.dados, media_type=m.mime or "image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400",
+                                 "X-Take-Sha256": m.sha256})
+    finally:
+        db.close()
+
+
+@app.get("/api/separacao/stats")
+def sep_stats(user: User = Depends(auth.get_current_user)):
+    from . import separacao as sp
+    db = SessionLocal()
+    try:
+        return sp.estatisticas(db, user.id)
+    finally:
+        db.close()
+
+
+@app.get("/api/separacao/lista")
+def sep_lista(busca: str = "", limite: int = 50, user: User = Depends(auth.get_current_user)):
+    from . import separacao as sp
+    db = SessionLocal()
+    try:
+        return {"sessoes": sp.listar(db, user.id, busca=busca, limite=min(limite, 200))}
+    finally:
+        db.close()
+
+
+@app.get("/api/separacao/{sessao_id}")
+def sep_dossie(sessao_id: int, user: User = Depends(auth.get_current_user)):
+    from . import separacao as sp
+    db = SessionLocal()
+    try:
+        d = sp.dossie(db, user.id, sessao_id)
+        if not d:
+            raise HTTPException(status_code=404, detail="dossiê não encontrado")
+        return d
+    finally:
+        db.close()
+
+
+@app.get("/api/separacao/{sessao_id}/verificar")
+def sep_verificar(sessao_id: int, user: User = Depends(auth.get_current_user)):
+    """Recalcula a cadeia inteira — é isto que prova que nada foi trocado."""
+    from . import separacao as sp
+    db = SessionLocal()
+    try:
+        return sp.verificar(db, user.id, sessao_id)
+    finally:
+        db.close()
+
+
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v5.4", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v5.5", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")

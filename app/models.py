@@ -1,7 +1,8 @@
 from datetime import datetime, date
 
 from sqlalchemy import (
-    Column, Integer, String, Text, DateTime, Date, Float, Boolean, ForeignKey, UniqueConstraint, JSON
+    Column, Integer, String, Text, DateTime, Date, Float, Boolean, ForeignKey, UniqueConstraint, JSON,
+    LargeBinary, Index
 )
 
 from .db import Base
@@ -747,3 +748,75 @@ class AgenteExecucao(Base):
     falhas = Column(Integer, default=0)
     detalhe = Column(JSON, nullable=True)                # [{item_id, titulo, agente, desconto_pct, preco, status}]
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROVA DE EXPEDIÇÃO — Mesa de Separação (mockup v3 aprovado)
+# Cada pedido conferido gera um DOSSIÊ: sessão + takes (imagens) + linha do tempo,
+# com cadeia de hash (SHA-256 encadeado). Imagens ficam em tabela PRÓPRIA para não
+# pesar nas consultas do painel.
+# ─────────────────────────────────────────────────────────────────────────────
+class SepSessao(Base):
+    """Uma sessão de conferência = um pedido separado = um dossiê."""
+    __tablename__ = "sep_sessao"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    codigo = Column(String, nullable=False, index=True)        # SEP-8842
+    canal = Column(String, nullable=False)                     # ml | shopee
+    pedido_id = Column(String, nullable=False, index=True)     # número do pedido no canal
+    cliente = Column(String, nullable=True)
+    cliente_doc = Column(String, nullable=True)
+    cidade = Column(String, nullable=True)
+    uf = Column(String, nullable=True)
+    nfe_numero = Column(String, nullable=True)
+    rastreio = Column(String, nullable=True)
+    valor = Column(Float, nullable=True)
+    itens = Column(JSON, nullable=True)        # [{sku,nome,qtd,ean,bin,ncm,peso,imagem}]
+    bancada = Column(String, nullable=True)
+    operador = Column(String, nullable=True)
+    qualidade = Column(String, default="padrao")   # economica | padrao | alta
+    aberta_em = Column(DateTime, default=datetime.utcnow, index=True)
+    selada_em = Column(DateTime, nullable=True)
+    duracao_seg = Column(Integer, nullable=True)
+    estado = Column(String, default="aberta", index=True)   # aberta | selada | cancelada
+    hash_final = Column(String, nullable=True)     # último elo da cadeia
+    integra = Column(Boolean, default=True)
+    bytes_total = Column(Integer, default=0)
+    usada_em_disputa = Column(Boolean, default=False)
+    exportada_por = Column(String, nullable=True)
+    exportada_em = Column(DateTime, nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "codigo", name="uq_sep_user_codigo"),)
+
+
+class SepMidia(Base):
+    """Take (imagem) do dossiê. O binário fica AQUI, isolado do resto do sistema."""
+    __tablename__ = "sep_midia"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    sessao_id = Column(Integer, ForeignKey("sep_sessao.id"), nullable=False, index=True)
+    ordem = Column(Integer, default=0)
+    passo = Column(String, nullable=True)      # abertura|bancada|conferencia|embalado|etiqueta|fechamento|avulso
+    modo = Column(String, default="auto")      # auto | manual | tique
+    gatilho = Column(String, nullable=True)    # texto do que disparou
+    mime = Column(String, default="image/jpeg")
+    largura = Column(Integer, nullable=True)
+    altura = Column(Integer, nullable=True)
+    bytes = Column(Integer, default=0)
+    dados = Column(LargeBinary, nullable=True)   # o JPEG já com a marca queimada
+    sha256 = Column(String, nullable=False, index=True)
+    hash_anterior = Column(String, nullable=True)
+    hash_elo = Column(String, nullable=False)    # sha256(hash_anterior + sha256 + meta)
+    criada_em = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class SepEvento(Base):
+    """Linha do tempo do dossiê: bipagens, tiques, divergências, selagem."""
+    __tablename__ = "sep_evento"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    sessao_id = Column(Integer, ForeignKey("sep_sessao.id"), nullable=False, index=True)
+    tipo = Column(String, nullable=False)   # abertura|bipagem_ok|bipagem_erro|tique|take|selagem|export
+    descricao = Column(String, nullable=True)
+    sku = Column(String, nullable=True)
+    dados = Column(JSON, nullable=True)
+    midia_id = Column(Integer, nullable=True)
+    criado_em = Column(DateTime, default=datetime.utcnow, index=True)
