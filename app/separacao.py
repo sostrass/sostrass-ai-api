@@ -250,24 +250,74 @@ def listar(db, user_id: int, busca: str = "", limite: int = 50) -> list:
 
 
 def estatisticas(db, user_id: int) -> dict:
-    """KPIs do topo da estação."""
+    """KPIs da bancada em tempo real, com o detalhe por trás de cada número."""
     from datetime import timedelta
-    hoje = datetime.utcnow() - timedelta(hours=24)
+    agora = datetime.utcnow()
+    h24 = agora - timedelta(hours=24)
     base = db.query(SepSessao).filter(SepSessao.user_id == user_id)
-    do_dia = base.filter(SepSessao.aberta_em >= hoje).all()
-    seladas = [s for s in do_dia if s.estado == "selada" and s.duracao_seg]
-    med = int(sum(s.duracao_seg for s in seladas) / len(seladas)) if seladas else 0
-    total_bytes = sum((s.bytes_total or 0) for s in base.all())
-    autos = db.query(SepMidia).filter(SepMidia.user_id == user_id, SepMidia.modo == "auto").count()
-    todos = db.query(SepMidia).filter(SepMidia.user_id == user_id).count()
+    do_dia = base.filter(SepSessao.aberta_em >= h24).all()
+    seladas = [x for x in do_dia if x.estado == "selada" and x.duracao_seg]
+    tempos = sorted(x.duracao_seg for x in seladas)
+    med = int(sum(tempos) / len(tempos)) if tempos else 0
+    mediana = tempos[len(tempos) // 2] if tempos else 0
+
+    # ritmo: pedidos por hora nas últimas 2h e projeção
+    h2 = agora - timedelta(hours=2)
+    ultimas2 = [x for x in seladas if x.selada_em and x.selada_em >= h2]
+    ritmo_h = round(len(ultimas2) / 2, 1) if ultimas2 else 0.0
+
+    # distribuição por hora (para o gráfico do detalhe)
+    por_hora = {}
+    for x in seladas:
+        if x.selada_em:
+            k = x.selada_em.strftime("%H")
+            por_hora[k] = por_hora.get(k, 0) + 1
+
+    # takes por modo
+    from sqlalchemy import func as _f
+    modos = dict(db.query(SepMidia.modo, _f.count(SepMidia.id))
+                 .filter(SepMidia.user_id == user_id).group_by(SepMidia.modo).all())
+    todos = sum(modos.values())
+    autos = modos.get("auto", 0)
+
+    # integridade: quantos dossiês com cadeia quebrada
+    quebrados = [x for x in base.all() if x.integra is False]
+
+    total_bytes = sum((x.bytes_total or 0) for x in base.all())
+    bytes_hoje = sum((x.bytes_total or 0) for x in do_dia)
+    kb_por_pedido = round(bytes_hoje / 1024 / len(do_dia), 1) if do_dia else 0
+    # projeção de ocupação em 90 dias no ritmo de hoje
+    proj90 = round(bytes_hoje * 90 / (1024 ** 3), 2) if bytes_hoje else 0
+
+    por_operador = {}
+    for x in seladas:
+        k = x.operador or "—"
+        d = por_operador.setdefault(k, {"pedidos": 0, "seg": 0})
+        d["pedidos"] += 1
+        d["seg"] += x.duracao_seg or 0
+    for k, v in por_operador.items():
+        v["medio"] = int(v["seg"] / v["pedidos"]) if v["pedidos"] else 0
+
     return {
-        "separados_hoje": len([s for s in do_dia if s.estado == "selada"]),
-        "abertas": len([s for s in do_dia if s.estado == "aberta"]),
+        "separados_hoje": len(seladas),
+        "abertas": len([x for x in do_dia if x.estado == "aberta"]),
         "tempo_medio_seg": med,
+        "tempo_mediana_seg": mediana,
+        "tempo_melhor_seg": tempos[0] if tempos else 0,
+        "tempo_pior_seg": tempos[-1] if tempos else 0,
+        "ritmo_hora": ritmo_h,
+        "por_hora": por_hora,
+        "por_operador": por_operador,
         "takes_auto_pct": round(autos / todos * 100) if todos else 0,
         "takes_total": todos,
-        "integros": len([s for s in do_dia if s.integra]),
+        "takes_por_modo": modos,
+        "integros": len([x for x in do_dia if x.integra]),
+        "dossies_total": base.count(),
+        "quebrados": len(quebrados),
+        "quebrados_codigos": [x.codigo for x in quebrados[:5]],
         "bytes_total": total_bytes,
         "gb_total": round(total_bytes / (1024 ** 3), 2),
-        "bytes_hoje": sum((s.bytes_total or 0) for s in do_dia),
+        "mb_hoje": round(bytes_hoje / (1024 ** 2), 1),
+        "kb_por_pedido": kb_por_pedido,
+        "projecao_90d_gb": proj90,
     }
