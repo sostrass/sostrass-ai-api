@@ -18,15 +18,19 @@ from datetime import datetime
 from .models import SepSessao, SepMidia, SepEvento
 
 # roteiro obrigatório (mockup v3): sem os 5, o dossiê não sela
-ROTEIRO = ["abertura", "bancada", "conferencia", "embalado", "etiqueta"]
+ROTEIRO = ["inicio", "pedido", "separacao", "conferencia", "embalagem", "etiqueta"]
 PASSO_LABEL = {
-    "abertura": "Abertura · pedido bipado",
-    "bancada": "Itens na bancada",
-    "conferencia": "Conferência dos SKUs",
-    "embalado": "Tudo embalado, antes de fechar",
-    "etiqueta": "Etiqueta colada e legível",
-    "fechamento": "Volume fechado",
+    "inicio": "1. Início da conferência",
+    "pedido": "2. Leitura do pedido de venda",
+    "separacao": "3. Separação dos itens",
+    "conferencia": "4. Conferência dos itens",
+    "embalagem": "5. Embalagem",
+    "etiqueta": "6. Impressão da etiqueta",
     "avulso": "Take avulso",
+    # compatibilidade com dossiês já gravados
+    "abertura": "1. Início da conferência",
+    "bancada": "3. Separação dos itens",
+    "embalado": "5. Embalagem",
 }
 GENESE = "0" * 64
 
