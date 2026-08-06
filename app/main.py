@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v5.7 — boot OK · 6 etapas + KPIs da bancada · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v5.8 — boot OK · consulta e download da prova · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -4161,10 +4161,114 @@ def sep_verificar(sessao_id: int, user: User = Depends(auth.get_current_user)):
         db.close()
 
 
+@app.get("/api/separacao/por-pedido/{pedido_id}")
+def sep_por_pedido(pedido_id: str, user: User = Depends(auth.get_current_user)):
+    """Existe prova de separação para este pedido? Usado no card lateral do pedido."""
+    from . import separacao as sp
+    from .models import SepSessao
+    db = SessionLocal()
+    try:
+        s = (db.query(SepSessao)
+             .filter(SepSessao.user_id == user.id, SepSessao.pedido_id == str(pedido_id))
+             .order_by(SepSessao.aberta_em.desc()).first())
+        if s is None:
+            return {"tem": False}
+        d = sp.dossie(db, user.id, s.id)
+        return {"tem": True, "sessao": d.get("sessao"), "takes": d.get("takes"),
+                "eventos": d.get("eventos"), "roteiro": d.get("roteiro")}
+    finally:
+        db.close()
+
+
+@app.get("/api/separacao/{sessao_id}/pacote")
+def sep_pacote(sessao_id: int, user: User = Depends(auth.get_current_user)):
+    """Baixa o dossiê inteiro como ZIP: fotos + manifesto com hashes + resumo legível.
+    É o arquivo que se envia ao canal numa reclamação."""
+    from . import separacao as sp
+    from .models import SepMidia, SepEvento as SepEventoRef
+    import io as _io, json as _json, zipfile
+    db = SessionLocal()
+    try:
+        d = sp.dossie(db, user.id, sessao_id)
+        if not d:
+            raise HTTPException(status_code=404, detail="dossiê não encontrado")
+        ses = d["sessao"]
+        verif = sp.verificar(db, user.id, sessao_id)
+        midias = (db.query(SepMidia)
+                  .filter(SepMidia.user_id == user.id, SepMidia.sessao_id == sessao_id)
+                  .order_by(SepMidia.ordem.asc()).all())
+        buf = _io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for m in midias:
+                nome = f"{m.ordem:02d}_{m.passo or 'take'}.jpg"
+                if m.dados:
+                    z.writestr(nome, m.dados)
+            # resumo legível para quem abrir o pacote
+            linhas = [
+                "PROVA DE SEPARAÇÃO E EXPEDIÇÃO",
+                "=" * 52, "",
+                f"Dossiê:        {ses.get('codigo')}",
+                f"Pedido:        {ses.get('pedido_id')} ({'Shopee' if ses.get('canal') == 'shopee' else 'Mercado Livre'})",
+                f"Cliente:       {ses.get('cliente') or '—'}",
+                f"Documento:     {ses.get('cliente_doc') or '—'}",
+                f"Destino:       {ses.get('cidade') or '—'}/{ses.get('uf') or '—'}",
+                f"NF-e:          {ses.get('nfe_numero') or '—'}",
+                f"Rastreio:      {ses.get('rastreio') or '—'}",
+                f"Valor:         R$ {ses.get('valor') or 0:.2f}",
+                f"Bancada:       {ses.get('bancada') or '—'}   Operador: {ses.get('operador') or '—'}",
+                f"Aberto em:     {ses.get('aberta_em')}",
+                f"Selado em:     {ses.get('selada_em')}",
+                f"Duração:       {ses.get('duracao_seg') or 0} s",
+                "",
+                "ITENS DO PEDIDO", "-" * 52,
+            ]
+            for it in (ses.get("itens") or []):
+                linhas.append(f"  {it.get('qtd', 1)}x  {it.get('nome', '')}  [SKU {it.get('sku', '—')}]")
+            linhas += ["", "IMAGENS (na ordem do processo)", "-" * 52]
+            for m in midias:
+                linhas.append(f"  {m.ordem:02d}_{m.passo}.jpg   {m.modo}   {round((m.bytes or 0)/1024,1)} KB")
+                linhas.append(f"      impressão digital (SHA-256): {m.sha256}")
+                linhas.append(f"      elo da cadeia:               {m.hash_elo}")
+            linhas += ["", "LINHA DO TEMPO", "-" * 52]
+            for e in (d.get("eventos") or []):
+                linhas.append(f"  {str(e.get('quando'))[:19]}  {e.get('tipo'):14s} {e.get('descricao') or ''}")
+            linhas += ["", "INTEGRIDADE", "-" * 52,
+                       f"  Cadeia íntegra: {'SIM' if verif.get('integra') else 'NÃO'}",
+                       f"  Imagens verificadas: {verif.get('takes')}",
+                       f"  Hash final: {ses.get('hash_final') or '—'}", "",
+                       "Cada imagem tem uma impressão digital que inclui a da imagem anterior.",
+                       "Trocar, editar ou remover qualquer arquivo quebra a cadeia e é detectável.",
+                       "Os dados do pedido estão gravados na própria imagem.", ""]
+            z.writestr("PROVA.txt", "\n".join(linhas))
+            z.writestr("manifesto.json", _json.dumps(
+                {"sessao": ses, "takes": d.get("takes"), "eventos": d.get("eventos"),
+                 "integridade": verif}, ensure_ascii=False, indent=2, default=str))
+        # marca como usado em disputa
+        try:
+            from .models import SepSessao as _SS
+            obj = db.query(_SS).filter(_SS.user_id == user.id, _SS.id == sessao_id).first()
+            if obj is not None:
+                obj.usada_em_disputa = True
+                obj.exportada_por = getattr(user, "email", None) or str(user.id)
+                obj.exportada_em = datetime.utcnow()
+                db.add(SepEventoRef(user_id=user.id, sessao_id=sessao_id, tipo="export",
+                                    descricao="dossiê exportado para envio ao canal",
+                                    criado_em=datetime.utcnow()))
+                db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+        buf.seek(0)
+        nome_zip = f"prova_{ses.get('codigo')}_pedido_{ses.get('pedido_id')}.zip"
+        return Response(content=buf.read(), media_type="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="{nome_zip}"'})
+    finally:
+        db.close()
+
+
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v5.7", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v5.8", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
