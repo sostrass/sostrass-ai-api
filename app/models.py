@@ -820,3 +820,67 @@ class SepEvento(Base):
     dados = Column(JSON, nullable=True)
     midia_id = Column(Integer, nullable=True)
     criado_em = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ShopeePedidoCache(Base):
+    """Cache dos pedidos Shopee. O painel lê DAQUI; a API só é chamada na sincronização
+    (delta por update_time) ou quando um pedido específico é atualizado. Isso derruba
+    o volume de chamadas de centenas por carga para poucas dezenas por dia."""
+    __tablename__ = "shopee_pedido_cache"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    order_sn = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=True, index=True)
+    update_time = Column(Integer, nullable=True, index=True)   # epoch do canal
+    create_time = Column(Integer, nullable=True, index=True)
+    ship_by = Column(Integer, nullable=True)
+    total = Column(Float, nullable=True)
+    comprador = Column(String, nullable=True)
+    cliente = Column(String, nullable=True)
+    cidade = Column(String, nullable=True)
+    uf = Column(String, nullable=True)
+    rastreio = Column(String, nullable=True)
+    nf_numero = Column(String, nullable=True)
+    payload = Column(JSON, nullable=True)      # o pedido enriquecido, pronto para o painel
+    desmascarado = Column(Boolean, default=False)
+    sincronizado_em = Column(DateTime, default=datetime.utcnow, index=True)
+    __table_args__ = (UniqueConstraint("user_id", "order_sn", name="uq_shopee_user_ordersn"),)
+
+
+class SyncEstado(Base):
+    """Marca d'água da última sincronização por canal — base do delta."""
+    __tablename__ = "sync_estado"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    canal = Column(String, nullable=False)      # shopee | ml
+    ultimo_sync = Column(DateTime, nullable=True)
+    ultimo_update_time = Column(Integer, nullable=True)   # maior update_time visto
+    pedidos_cache = Column(Integer, default=0)
+    chamadas_ultimo_sync = Column(Integer, default=0)
+    __table_args__ = (UniqueConstraint("user_id", "canal", name="uq_sync_user_canal"),)
+
+
+class ShopeeAvaliacaoCache(Base):
+    """Cache permanente das avaliações. O que já foi respondido NUNCA é relido:
+    a varredura passa a pedir só `comment_status=UNANSWERED` e o resto vem daqui.
+    Isso derruba get_comment de ~600/dia para poucas dezenas e elimina as tentativas
+    de responder o que já tem resposta (causa provável das 245 falhas de reply)."""
+    __tablename__ = "shopee_avaliacao_cache"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    comment_id = Column(String, nullable=False, index=True)
+    item_id = Column(String, nullable=True, index=True)
+    order_sn = Column(String, nullable=True)
+    rating = Column(Integer, nullable=True, index=True)
+    comentario = Column(Text, nullable=True)
+    comprador = Column(String, nullable=True)
+    tem_midia = Column(Boolean, default=False)
+    create_time = Column(Integer, nullable=True, index=True)
+    respondida = Column(Boolean, default=False, index=True)
+    resposta = Column(Text, nullable=True)
+    respondida_em = Column(DateTime, nullable=True)
+    tentativas = Column(Integer, default=0)        # trava depois de N falhas
+    ultimo_erro = Column(String, nullable=True)
+    payload = Column(JSON, nullable=True)
+    visto_em = Column(DateTime, default=datetime.utcnow, index=True)
+    __table_args__ = (UniqueConstraint("user_id", "comment_id", name="uq_aval_user_comment"),)

@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v5.8 — boot OK · consulta e download da prova · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v6.0 — boot OK · cache de avaliações (só UNANSWERED) · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -1720,8 +1720,19 @@ def shopee_pedidos_painel(status: str = "A_ENVIAR", dias: int = 15, page: int = 
     """Pedidos enriquecidos + análise de valor (pago x preço de tabela), PAGINADO.
     Filtros: status (Meus Pedidos), grupo (aberto/concluído), nf (situação da NF), busca+busca_tipo."""
     try:
-        r = shopee.pedidos_painel(user.id, status=status, dias=dias, page=page, page_size=page_size,
-                                  busca=busca, busca_tipo=busca_tipo, grupo=grupo, nf=nf)
+        # CACHE-FIRST: o painel lê do BANCO. A API só é chamada na sincronização
+        # (endpoint /api/shopee/sincronizar) ou ao atualizar um pedido específico.
+        from . import shopee_cache as _sc
+        _db = SessionLocal()
+        try:
+            est = _sc.estado(_db, user.id)
+            if est.get("precisa_sync"):
+                # primeira carga: popula o cache uma única vez
+                _sc.sincronizar(_db, user.id, dias=dias, completo=True)
+            r = _sc.listar(_db, user.id, status=status, dias=dias, page=page,
+                           page_size=page_size, busca=busca)
+        finally:
+            _db.close()
         # A Shopee nem sempre manda `image_info` no pedido — o catálogo (que já temos) tem a
         # foto por SKU. Preenche o que faltar para o card nunca ficar sem imagem.
         try:
@@ -4265,10 +4276,94 @@ def sep_pacote(sessao_id: int, user: User = Depends(auth.get_current_user)):
         db.close()
 
 
+@app.post("/api/shopee/sincronizar")
+def shopee_sincronizar(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """Atualiza o cache a partir da API — só o DELTA por padrão.
+    É a ÚNICA rotina que fala com a Shopee em volume."""
+    from . import shopee_cache as _sc
+    db = SessionLocal()
+    try:
+        return _sc.sincronizar(db, user.id, dias=int(payload.get("dias") or 15),
+                               completo=bool(payload.get("completo")))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": f"{type(e).__name__}: {str(e)[:200]}"}
+    finally:
+        db.close()
+
+
+@app.post("/api/shopee/atualizar-pedido")
+def shopee_atualizar_pedido(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """Atualiza UM pedido no cache. 1 chamada à API, não 12 páginas."""
+    from . import shopee_cache as _sc
+    sn = str(payload.get("order_sn") or "").strip()
+    if not sn:
+        return {"ok": False, "erro": "informe order_sn"}
+    db = SessionLocal()
+    try:
+        return _sc.atualizar_um(db, user.id, sn)
+    finally:
+        db.close()
+
+
+@app.get("/api/shopee/cache-estado")
+def shopee_cache_estado(user: User = Depends(auth.get_current_user)):
+    """Quantos pedidos há no cache e há quanto tempo foi a última sincronização."""
+    from . import shopee_cache as _sc
+    db = SessionLocal()
+    try:
+        return _sc.estado(db, user.id)
+    finally:
+        db.close()
+
+
+@app.post("/api/shopee/avaliacoes/varrer")
+def aval_varrer(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """Varre SÓ as não respondidas (comment_status=UNANSWERED) e grava no cache."""
+    from . import shopee_avaliacoes as av
+    db = SessionLocal()
+    try:
+        return av.varrer_pendentes(db, user.id, max_paginas=int(payload.get("max_paginas") or 5))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erro": f"{type(e).__name__}: {str(e)[:200]}"}
+    finally:
+        db.close()
+
+
+@app.post("/api/shopee/avaliacoes/semear")
+def aval_semear(user: User = Depends(auth.get_current_user)):
+    """Carga ÚNICA do histórico de respondidas — depois disso nunca mais são lidas."""
+    from . import shopee_avaliacoes as av
+    db = SessionLocal()
+    try:
+        return av.semear_respondidas(db, user.id)
+    finally:
+        db.close()
+
+
+@app.get("/api/shopee/avaliacoes/estado")
+def aval_estado(user: User = Depends(auth.get_current_user)):
+    from . import shopee_avaliacoes as av
+    db = SessionLocal()
+    try:
+        return av.estado(db, user.id)
+    finally:
+        db.close()
+
+
+@app.get("/api/shopee/avaliacoes/pendentes")
+def aval_pendentes(limite: int = 60, user: User = Depends(auth.get_current_user)):
+    from . import shopee_avaliacoes as av
+    db = SessionLocal()
+    try:
+        return {"pendentes": av.pendentes(db, user.id, limite=min(limite, 200))}
+    finally:
+        db.close()
+
+
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v5.8", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v6.0", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")

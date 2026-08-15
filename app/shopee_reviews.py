@@ -152,7 +152,7 @@ def _serializar(c: ShopeeReviewConfig) -> dict:
         "usar_emoji": bool(c.usar_emoji),
         "auto_estrelas": list(c.auto_estrelas or [4, 5]),
         "auto_pausa_seg": c.auto_pausa_seg if c.auto_pausa_seg is not None else 5,
-        "auto_max_ciclo": c.auto_max_ciclo if c.auto_max_ciclo is not None else 10,
+        "auto_max_ciclo": c.auto_max_ciclo if c.auto_max_ciclo is not None else 40,
         "emoji_intensidade": getattr(c, "emoji_intensidade", None) or "leve",
         "instrucoes_elogio": getattr(c, "instrucoes_elogio", None) or "",
         "instrucoes_morna": getattr(c, "instrucoes_morna", None) or "",
@@ -417,15 +417,41 @@ def _rodar_mutirao(user_id: int, completo: bool = False):
                 resp = shopee.comentarios_brutos(user_id, status="UNANSWERED", cursor=cursor, limite=100)
             except shopee.ShopeeError:
                 break
-            _coletar(resp.get("item_comment_list") or [])
+            _lote = resp.get("item_comment_list") or []
+            _coletar(_lote)
+            try:   # espelha no cache: o que for respondido some da varredura para sempre
+                from .db import SessionLocal as _SL2
+                from . import shopee_avaliacoes as _av2
+                _d2 = _SL2()
+                try:
+                    for _c in _lote:
+                        _av2._gravar(_d2, user_id, _c)
+                    _d2.commit()
+                finally:
+                    _d2.close()
+            except Exception:  # noqa: BLE001
+                pass
             _set_prog(user_id, fase="descobrindo", alvo=len(pendentes))
             cursor = resp.get("next_cursor") or ""
             if not resp.get("more") or not cursor:
                 break
             time.sleep(0.15)
 
-        # FASE 1b — varredura POR PRODUTO (alcança as antigas além do limite global da Shopee)
-        if completo and user_id not in _PARAR:
+        # FASE 1b — varredura POR PRODUTO. ERA O MAIOR CONSUMIDOR DA API: com ~5.240 SKUs,
+        # varria um get_comment por produto a cada ciclo. Agora só roda na PRIMEIRA carga,
+        # quando o cache de avaliações ainda está vazio — depois disso o banco cobre o histórico.
+        _cache_vazio = True
+        try:
+            from .db import SessionLocal as _SL
+            from . import shopee_avaliacoes as _av
+            _d = _SL()
+            try:
+                _cache_vazio = _av.estado(_d, user_id).get("total_no_cache", 0) == 0
+            finally:
+                _d.close()
+        except Exception:  # noqa: BLE001
+            pass
+        if completo and _cache_vazio and user_id not in _PARAR:
             try:
                 item_ids = shopee.todos_item_ids(user_id)
             except shopee.ShopeeError:
@@ -459,6 +485,25 @@ def _rodar_mutirao(user_id: int, completo: bool = False):
         except shopee.ShopeeError:
             pass
 
+        # filtra pelo cache: nunca tenta o que já foi respondido nem o que travou em 3 falhas
+        try:
+            from .db import SessionLocal as _SL5
+            from . import shopee_avaliacoes as _av5
+            from .models import ShopeeAvaliacaoCache as _AC
+            _d5 = _SL5()
+            try:
+                bloqueados = {r[0] for r in _d5.query(_AC.comment_id).filter(
+                    _AC.user_id == user_id,
+                    (_AC.respondida == True) | (_AC.tentativas >= _av5.MAX_TENTATIVAS)).all()}  # noqa: E712
+                antes_filtro = len(pendentes)
+                pendentes = [c for c in pendentes if str(c.get("comment_id")) not in bloqueados]
+                if antes_filtro != len(pendentes):
+                    print(f"[reviews] {antes_filtro - len(pendentes)} avaliação(ões) já respondidas foram puladas", flush=True)
+            finally:
+                _d5.close()
+        except Exception:  # noqa: BLE001
+            pass
+
         _set_prog(user_id, fase="respondendo", alvo=len(pendentes), processados=0)
 
         # FASE 2 — responder cada um, espaçado
@@ -475,6 +520,14 @@ def _rodar_mutirao(user_id: int, completo: bool = False):
                     continue
                 shopee.responder_avaliacao(user_id, c.get("comment_id"), texto)
                 respondidos += 1
+                try:   # marca como respondida: sai da varredura definitivamente
+                    from .db import SessionLocal as _SL3
+                    from . import shopee_avaliacoes as _av3
+                    _d3 = _SL3()
+                    try: _av3.marcar_respondida(_d3, user_id, c.get("comment_id"), texto)
+                    finally: _d3.close()
+                except Exception:  # noqa: BLE001
+                    pass
                 _registrar_log(user_id, c.get("comment_id"), nota, buyer, produto, texto, "auto")
                 _set_prog(user_id, processados=respondidos,
                           ultimo={"nota": nota, "buyer": buyer, "produto": produto,
@@ -485,8 +538,16 @@ def _rodar_mutirao(user_id: int, completo: bool = False):
                     cache["pendentes"] = max(0, cache.get("pendentes", 0) - 1)
                 if pausa:
                     time.sleep(pausa)
-            except Exception:  # noqa: BLE001 — um erro não derruba o mutirão
+            except Exception as _e:  # noqa: BLE001 — um erro não derruba o mutirão
                 falhas += 1
+                try:   # conta a tentativa; após 3, aquela avaliação sai da fila
+                    from .db import SessionLocal as _SL4
+                    from . import shopee_avaliacoes as _av4
+                    _d4 = _SL4()
+                    try: _av4.marcar_falha(_d4, user_id, c.get("comment_id"), str(_e))
+                    finally: _d4.close()
+                except Exception:  # noqa: BLE001
+                    pass
                 continue
     finally:
         interrompido = user_id in _PARAR
@@ -517,7 +578,7 @@ def auto_responder(user_id: int, limite: int = 100) -> dict:
         modo = cfg.modo
         alvos = set(cfg.auto_estrelas or [4, 5])
         pausa = max(int(cfg.auto_pausa_seg or 5), 0)      # segundos entre respostas (anti-flood)
-        max_ciclo = max(int(cfg.auto_max_ciclo or 10), 1)  # teto de respostas por ciclo
+        max_ciclo = max(int(cfg.auto_max_ciclo or 40), 1)  # teto de respostas por ciclo
         cfg_snap = ShopeeReviewConfig(
             modo=cfg.modo, tom=cfg.tom, limite_chars=cfg.limite_chars,
             assinatura=cfg.assinatura, saudacao=cfg.saudacao, instrucoes=cfg.instrucoes,
