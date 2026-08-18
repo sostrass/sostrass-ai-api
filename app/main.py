@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v6.1 — boot OK · bundle deal corrigido (time_status numérico) · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v6.3 — boot OK · varredura profunda de avaliações · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -4325,6 +4325,36 @@ def shopee_cache_estado(user: User = Depends(auth.get_current_user)):
         db.close()
 
 
+@app.post("/api/shopee/avaliacoes/profunda")
+def aval_profunda(payload: dict = Body(default={}), tarefas: BackgroundTasks = None,
+                  user: User = Depends(auth.get_current_user)):
+    """Varredura PROFUNDA (produto a produto) — alcança as avaliações antigas que a
+    paginação global não devolve (teto de ~1.000). Roda em segundo plano."""
+    from . import shopee_avaliacoes as av
+    def _rodar(uid):
+        db = SessionLocal()
+        try:
+            r = av.varredura_profunda(db, uid, item_ids=payload.get("item_ids") or None)
+            print(f"[profunda] concluída: {r}", flush=True)
+        finally:
+            db.close()
+    if tarefas is not None:
+        tarefas.add_task(_rodar, user.id)
+        return {"ok": True, "iniciada": True,
+                "aviso": "rodando em segundo plano — acompanhe em /api/shopee/avaliacoes/profunda/progresso"}
+    db = SessionLocal()
+    try:
+        return av.varredura_profunda(db, user.id)
+    finally:
+        db.close()
+
+
+@app.get("/api/shopee/avaliacoes/profunda/progresso")
+def aval_profunda_prog(user: User = Depends(auth.get_current_user)):
+    from . import shopee_avaliacoes as av
+    return av.progresso_profunda(user.id)
+
+
 @app.post("/api/shopee/avaliacoes/varrer")
 def aval_varrer(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
     """Varre SÓ as não respondidas (comment_status=UNANSWERED) e grava no cache."""
@@ -4360,16 +4390,23 @@ def aval_estado(user: User = Depends(auth.get_current_user)):
 
 
 @app.get("/api/shopee/avaliacoes/pendentes")
-def aval_pendentes(limite: int = 60, user: User = Depends(auth.get_current_user)):
+def aval_pendentes(limite: int = 500, user: User = Depends(auth.get_current_user)):
     from . import shopee_avaliacoes as av
     db = SessionLocal()
     try:
-        return {"pendentes": av.pendentes(db, user.id, limite=min(limite, 200))}
+        return {"pendentes": av.pendentes(db, user.id, limite=min(limite, 3000))}
     finally:
         db.close()
 
 
 # ───────── Bundle Deal · "Leve Mais por Menos" (implementação corrigida) ─────────
+@app.get("/api/shopee/bundle/_estrutura")
+def bundle_estrutura(bundle_id: int = 0, user: User = Depends(auth.get_current_user)):
+    """Lê de volta um combo criado à mão e revela como a Shopee representa os NÍVEIS."""
+    from . import shopee_bundle as bd
+    return bd.ler_estrutura(user.id, bundle_id or None)
+
+
 @app.get("/api/shopee/bundle/_diag")
 def bundle_diag(user: User = Depends(auth.get_current_user)):
     """Testa as variantes do time_status e diz QUAL a Shopee aceita.
@@ -4437,7 +4474,7 @@ def bundle_encerrar(bundle_id: int, user: User = Depends(auth.get_current_user))
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v6.1", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v6.3", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")

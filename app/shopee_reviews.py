@@ -63,6 +63,25 @@ def historico_log(user_id: int, limite: int = 20) -> list:
 def contar_avaliacoes(user_id: int, max_paginas: int = 60, forcar: bool = False) -> dict:
     """Conta respondidas x pendentes paginando a Shopee (caro). Cacheia por ~10 min.
     parcial=True se bateu o teto de páginas (loja com muitas avaliações)."""
+    # PREFERE O CACHE DO BANCO: a paginação global da Shopee para em ~1.000 e devolve
+    # contagem falsa. O cache tem tudo o que já foi varrido, inclusive a varredura
+    # profunda por produto — é a contagem verdadeira.
+    try:
+        from .db import SessionLocal as _SLc
+        from . import shopee_avaliacoes as _avc
+        _dc = _SLc()
+        try:
+            _e = _avc.estado(_dc, user_id)
+            if (_e.get("total_no_cache") or 0) > 0 and not forcar:
+                return {"respondidas": _e["respondidas"], "pendentes": _e["pendentes"],
+                        "total": _e["total_no_cache"], "parcial": False,
+                        "fonte": "cache do banco (contagem completa)",
+                        "travadas": _e.get("travadas", 0)}
+        finally:
+            _dc.close()
+    except Exception:  # noqa: BLE001
+        pass
+
     cache = _CONTAGEM.get(user_id)
     anterior_pend = cache.get("pendentes") if cache else None
     if cache and not forcar:

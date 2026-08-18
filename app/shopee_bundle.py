@@ -230,3 +230,47 @@ def instalar_correcao() -> bool:
     except Exception as e:  # noqa: BLE001
         print(f"[bundle] não consegui instalar a correção: {e}", flush=True)
         return False
+
+def ler_estrutura(user_id: int, bundle_id=None) -> dict:
+    """REVELA como a Shopee representa os NÍVEIS (Compre 2 -> 5%, Compre 3 -> 7%...).
+
+    Por que existe: a tela do Seller Center mostra vários níveis por combo, mas a
+    documentação do bundle_deal descreve UMA regra só. Em vez de adivinhar a estrutura
+    e errar de novo, lemos de volta um combo criado À MÃO no painel da Shopee — a
+    resposta da própria API mostra o formato exato que devemos enviar.
+
+    Uso: crie um combo com 3 níveis no Seller Center e chame este endpoint.
+    """
+    out = {"instrucao": "crie 1 combo com vários níveis no Seller Center e rode isto"}
+    try:
+        if bundle_id:
+            r = shopee._chamar(user_id, "/api/v2/bundle_deal/get_bundle_deal",
+                               extra={"bundle_deal_id": int(bundle_id)})
+            bruto = (r.get("response") or {})
+        else:
+            r = shopee._chamar(user_id, "/api/v2/bundle_deal/get_bundle_deal_list",
+                               extra={"time_status": 1, "page_size": 20})
+            lista = ((r.get("response") or {}).get("bundle_deal_list") or [])
+            out["combos_encontrados"] = len(lista)
+            bruto = lista[0] if lista else {}
+        if not bruto:
+            out["veredito"] = "nenhum combo na loja — crie um no Seller Center para eu ler a estrutura"
+            return out
+        out["combo_bruto"] = bruto
+        regra = bruto.get("bundle_deal_rule") or {}
+        out["regra_bruta"] = regra
+        # procura qualquer campo que pareça uma LISTA de níveis
+        niveis = []
+        for k, v in list(bruto.items()) + list(regra.items()):
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                if any(x in str(v[0]).lower() for x in ("amount", "percentage", "price", "discount")):
+                    niveis.append({"campo": k, "exemplo": v[:3], "quantidade": len(v)})
+        out["possiveis_niveis"] = niveis
+        out["veredito"] = (f"NÍVEIS ficam no campo '{niveis[0]['campo']}' ({niveis[0]['quantidade']} nível/níveis)"
+                           if niveis else
+                           "a API devolveu UMA regra só — o combo com níveis pode ser outro recurso, "
+                           "ou cada nível vira um bundle separado")
+        out["campos_da_regra"] = sorted(regra.keys())
+    except Exception as e:  # noqa: BLE001
+        out["erro"] = f"{type(e).__name__}: {str(e)[:250]}"
+    return out

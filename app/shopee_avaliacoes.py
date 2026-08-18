@@ -62,7 +62,7 @@ def _gravar(db, user_id: int, c: dict) -> ShopeeAvaliacaoCache:
     return linha
 
 
-def varrer_pendentes(db, user_id: int, max_paginas: int = 5) -> dict:
+def varrer_pendentes(db, user_id: int, max_paginas: int = 15) -> dict:
     """Busca APENAS as não respondidas (comment_status=UNANSWERED) e grava no cache.
     Poucas páginas bastam: o normal é ter dezenas pendentes, não milhares."""
     chamadas = novas = 0
@@ -188,3 +188,73 @@ def semear_respondidas(db, user_id: int, max_paginas: int = 30) -> dict:
         cursor = r.get("next_cursor")
     return {"ok": True, "chamadas_api": chamadas, "gravadas": gravadas,
             "aviso": "carga única — a partir de agora só UNANSWERED é lido"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VARREDURA PROFUNDA — alcança as avaliações ALÉM do teto de ~1.000
+#
+# A paginação global do get_comment para em torno de 1.000 registros (a própria
+# Shopee limita a profundidade do cursor). Com 1.600+ pendentes, as mais antigas
+# ficam inalcançáveis por ali. O único caminho é varrer POR PRODUTO (item_id).
+#
+# Isso custa 1 chamada por produto — caro se repetido a cada ciclo (era o defeito
+# antigo). Aqui roda SOB DEMANDA e o resultado fica no cache: cada avaliação
+# encontrada nunca mais precisa ser buscada.
+# ─────────────────────────────────────────────────────────────────────────────
+_PROG_PROFUNDA: dict = {}
+
+
+def progresso_profunda(user_id: int) -> dict:
+    return _PROG_PROFUNDA.get(user_id) or {"em_andamento": False}
+
+
+def varredura_profunda(db, user_id: int, item_ids: list = None,
+                       max_produtos: int = 6000, pausa: float = 0.12) -> dict:
+    """Percorre produto a produto atrás das avaliações antigas sem resposta."""
+    from . import shopee as _sh
+    import time as _t
+
+    ids = [int(i) for i in (item_ids or []) if i]
+    if not ids:   # sem lista explícita, pega o catálogo da loja
+        try:
+            cursor, ids = "", []
+            for _ in range(60):
+                r = _sh._chamar(user_id, "/api/v2/product/get_item_list",
+                                extra={"offset": len(ids), "page_size": 100,
+                                       "item_status": "NORMAL"})
+                lote = ((r.get("response") or {}).get("item") or [])
+                ids += [int(x.get("item_id")) for x in lote if x.get("item_id")]
+                if not (r.get("response") or {}).get("has_next_page"):
+                    break
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "erro": f"não consegui listar os produtos: {str(e)[:200]}"}
+
+    ids = ids[:max_produtos]
+    _PROG_PROFUNDA[user_id] = {"em_andamento": True, "total": len(ids), "feitos": 0,
+                               "encontradas": 0, "chamadas": 0,
+                               "inicio": datetime.utcnow().isoformat()}
+    achadas = chamadas = 0
+    ja_no_cache = {r[0] for r in db.query(ShopeeAvaliacaoCache.comment_id)
+                   .filter(ShopeeAvaliacaoCache.user_id == user_id).all()}
+    for n, iid in enumerate(ids, 1):
+        try:
+            r = _sh.comentarios_brutos(user_id, item_id=iid, status="UNANSWERED", limite=100)
+            chamadas += 1
+            for c in (r.get("item_comment_list") or []):
+                cid = str(c.get("comment_id") or "")
+                _gravar(db, user_id, c)
+                if cid and cid not in ja_no_cache:
+                    achadas += 1
+                    ja_no_cache.add(cid)
+            if n % 25 == 0:
+                db.commit()
+        except Exception as e:  # noqa: BLE001
+            print(f"[profunda] item {iid}: {str(e)[:90]}", flush=True)
+        _PROG_PROFUNDA[user_id].update({"feitos": n, "encontradas": achadas, "chamadas": chamadas})
+        if pausa:
+            _t.sleep(pausa)     # respiro entre chamadas — não estressa a API
+    db.commit()
+    _PROG_PROFUNDA[user_id].update({"em_andamento": False, "fim": datetime.utcnow().isoformat()})
+    return {"ok": True, "produtos_varridos": len(ids), "chamadas_api": chamadas,
+            "avaliacoes_novas": achadas, "pendentes_agora": pendentes_qtd(db, user_id),
+            "aviso": "carga única — o que foi encontrado fica no cache e não é buscado de novo"}
