@@ -159,12 +159,14 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v6.0 — boot OK · cache de avaliações (só UNANSWERED) · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v6.1 — boot OK · bundle deal corrigido (time_status numérico) · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
     # antes uma lista fixa engolia erros e podia pular tabelas novas (ex.: shopee_sync).
     try:
+        from . import shopee_bundle as _bd   # corrige listar_bundles (time_status numérico)
+        _bd.instalar_correcao()
         from . import models as _modelos  # noqa: F401 — registra todos os modelos no metadata
         Base.metadata.create_all(bind=engine)
     except Exception:  # noqa: BLE001
@@ -2039,10 +2041,17 @@ def shopee_reprecificar(payload: dict = Body(...), user: User = Depends(auth.get
 # ---- Bundle Deal ----
 @app.get("/api/shopee/bundles")
 def shopee_bundles(status: str = "ongoing", user: User = Depends(auth.get_current_user)):
+    """Redirecionado para a implementação corrigida: o antigo mandava time_status como
+    TEXTO e falhava 100% das vezes (52 de 52 em junho/2026)."""
+    from . import shopee_bundle as bd
     try:
-        return shopee.listar_bundles(user.id, status=status)
-    except shopee.ShopeeError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        r = bd.listar(user.id, status=status)
+        # mantém o formato antigo para não quebrar quem já consome
+        return {"response": {"bundle_deal_list": [b["bruto"] for b in r["bundles"]],
+                             "more": r["more"], "next_cursor": r["next_cursor"]},
+                "bundles": r["bundles"], "status_nome": r["status_nome"]}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e)[:220])
 
 
 @app.post("/api/shopee/bundles")
@@ -4360,10 +4369,75 @@ def aval_pendentes(limite: int = 60, user: User = Depends(auth.get_current_user)
         db.close()
 
 
+# ───────── Bundle Deal · "Leve Mais por Menos" (implementação corrigida) ─────────
+@app.get("/api/shopee/bundle/_diag")
+def bundle_diag(user: User = Depends(auth.get_current_user)):
+    """Testa as variantes do time_status e diz QUAL a Shopee aceita.
+    É como validamos a correção contra a API real, sem adivinhar."""
+    from . import shopee_bundle as bd
+    try:
+        return bd.diagnostico(user.id)
+    except Exception as e:  # noqa: BLE001
+        return {"erro": f"{type(e).__name__}: {str(e)[:220]}"}
+
+
+@app.get("/api/shopee/bundle/listar")
+def bundle_listar(status: str = "1", limite: int = 100, cursor: str = "",
+                  user: User = Depends(auth.get_current_user)):
+    from . import shopee_bundle as bd
+    try:
+        return bd.listar(user.id, status=status, limite=limite, cursor=cursor)
+    except Exception as e:  # noqa: BLE001
+        return {"bundles": [], "erro": f"{type(e).__name__}: {str(e)[:220]}"}
+
+
+@app.get("/api/shopee/bundle/{bundle_id}")
+def bundle_detalhe(bundle_id: int, user: User = Depends(auth.get_current_user)):
+    from . import shopee_bundle as bd
+    try:
+        return bd.detalhe(user.id, bundle_id)
+    except Exception as e:  # noqa: BLE001
+        return {"erro": str(e)[:220]}
+
+
+@app.post("/api/shopee/bundle/criar")
+def bundle_criar(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """Cria o combo. Valida nome, janela, duração e mínimo ANTES de chamar a Shopee."""
+    from . import shopee_bundle as bd
+    try:
+        return bd.criar(user.id,
+                        nome=payload.get("nome") or "",
+                        inicio=int(payload.get("inicio") or 0),
+                        fim=int(payload.get("fim") or 0),
+                        rule_type=int(payload.get("rule_type") or 2),
+                        valor=float(payload.get("valor") or 0),
+                        min_itens=int(payload.get("min_itens") or 2),
+                        item_ids=payload.get("item_ids") or [],
+                        limite_compra=int(payload.get("limite_compra") or 0))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erros": [f"{type(e).__name__}: {str(e)[:220]}"]}
+
+
+@app.post("/api/shopee/bundle/{bundle_id}/itens")
+def bundle_itens(bundle_id: int, payload: dict = Body(default={}),
+                 user: User = Depends(auth.get_current_user)):
+    from . import shopee_bundle as bd
+    try:
+        return bd.adicionar_itens(user.id, bundle_id, payload.get("item_ids") or [])
+    except Exception as e:  # noqa: BLE001
+        return {"adicionados": 0, "erros": [str(e)[:220]]}
+
+
+@app.post("/api/shopee/bundle/{bundle_id}/encerrar")
+def bundle_encerrar(bundle_id: int, user: User = Depends(auth.get_current_user)):
+    from . import shopee_bundle as bd
+    return bd.encerrar(user.id, bundle_id)
+
+
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v6.0", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v6.1", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
