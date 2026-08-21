@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v6.3 — boot OK · varredura profunda de avaliações · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v6.5 — boot OK · bundle com níveis + termômetro de campanhas · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -4400,6 +4400,71 @@ def aval_pendentes(limite: int = 500, user: User = Depends(auth.get_current_user
 
 
 # ───────── Bundle Deal · "Leve Mais por Menos" (implementação corrigida) ─────────
+@app.post("/api/shopee/bundle/criar-niveis")
+def bundle_criar_niveis(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    """Cria o combo com até 3 NÍVEIS (o que a tela da Shopee permite)."""
+    from . import shopee_bundle as bd
+    try:
+        return bd.criar_com_niveis(user.id, payload)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "erros": [f"{type(e).__name__}: {str(e)[:220]}"]}
+
+
+@app.get("/api/shopee/campanhas/painel")
+def campanhas_painel(user: User = Depends(auth.get_current_user)):
+    """Painel ao vivo: campanhas ativas/agendadas/encerradas com termômetro e KPIs."""
+    from . import shopee_metricas as mt
+    db = SessionLocal()
+    try:
+        return mt.painel_campanhas(db, user.id)
+    except Exception as e:  # noqa: BLE001
+        return {"campanhas": [], "erro": f"{type(e).__name__}: {str(e)[:200]}"}
+    finally:
+        db.close()
+
+
+@app.get("/api/shopee/campanhas/elasticidade")
+def campanhas_elasticidade(dias: int = 90, user: User = Depends(auth.get_current_user)):
+    from . import shopee_metricas as mt
+    db = SessionLocal()
+    try:
+        return mt.elasticidade(db, user.id, dias=dias)
+    finally:
+        db.close()
+
+
+@app.get("/api/shopee/campanhas/slots")
+def campanhas_slots(user: User = Depends(auth.get_current_user)):
+    from . import shopee_metricas as mt
+    db = SessionLocal()
+    try:
+        return mt.slots(db, user.id)
+    finally:
+        db.close()
+
+
+@app.get("/api/shopee/campanhas/heatmap")
+def campanhas_heatmap(dias: int = 30, item_ids: str = "", user: User = Depends(auth.get_current_user)):
+    from . import shopee_metricas as mt
+    db = SessionLocal()
+    try:
+        ids = [x for x in (item_ids or "").split(",") if x]
+        return mt.heatmap_horario(db, user.id, dias=dias, item_ids=ids)
+    finally:
+        db.close()
+
+
+@app.post("/api/shopee/campanhas/termometro")
+def campanhas_termometro(payload: dict = Body(default={}), user: User = Depends(auth.get_current_user)):
+    from . import shopee_metricas as mt
+    db = SessionLocal()
+    try:
+        return mt.termometro(db, user.id, payload.get("campanha") or {},
+                             dias=int(payload.get("dias") or 30))
+    finally:
+        db.close()
+
+
 @app.get("/api/shopee/bundle/_estrutura")
 def bundle_estrutura(bundle_id: int = 0, user: User = Depends(auth.get_current_user)):
     """Lê de volta um combo criado à mão e revela como a Shopee representa os NÍVEIS."""
@@ -4474,7 +4539,7 @@ def bundle_encerrar(bundle_id: int, user: User = Depends(auth.get_current_user))
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v6.3", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v6.5", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")

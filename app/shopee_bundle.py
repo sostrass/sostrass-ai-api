@@ -219,13 +219,30 @@ def instalar_correcao() -> bool:
     continuaria mandando `time_status` como texto e falhando em silêncio.
     Trocando a função no import, TODOS os chamadores passam a usar o parâmetro certo.
     """
+    # ── criar_bundle: o campo do valor mudava conforme o tipo e o código antigo
+    # mandava sempre `discount_value`. O agente AUTOMÁTICO usa rule_type=2
+    # (percentual) por padrão — ou seja, TODA campanha automática de combo falhava.
+    def _criar_corrigido(user_id: int, nome: str, inicio: int, fim: int, rule_type: int,
+                         valor: float, min_itens: int, item_ids: list) -> dict:
+        regra = montar_regra(rule_type, valor, min_itens)
+        corpo = {"name": str(nome)[:25], "start_time": int(inicio), "end_time": int(fim),
+                 "bundle_deal_rule": regra}
+        r = shopee._chamar(user_id, "/api/v2/bundle_deal/add_bundle_deal",
+                           metodo="POST", extra=corpo)
+        bid = (r.get("response") or {}).get("bundle_deal_id")
+        if bid and item_ids:
+            adicionar_itens(user_id, bid, item_ids)
+        return {"bundle_deal_id": bid, "response": r.get("response") or {}}
+
     def _corrigida(user_id: int, status="ongoing", limite: int = 50) -> dict:
         r = listar(user_id, status=status, limite=limite)
         return {"response": {"bundle_deal_list": [b["bruto"] for b in r["bundles"]],
                              "more": r["more"], "next_cursor": r["next_cursor"]}}
     try:
         shopee.listar_bundles = _corrigida
-        print("[bundle] correção instalada: time_status numérico em todos os chamadores", flush=True)
+        shopee.criar_bundle = _criar_corrigido      # conserta também o agente AUTOMÁTICO
+        print("[bundle] correção instalada: time_status numérico + campo do valor por tipo "
+              "(vale para o modo manual E o automático)", flush=True)
         return True
     except Exception as e:  # noqa: BLE001
         print(f"[bundle] não consegui instalar a correção: {e}", flush=True)
@@ -274,3 +291,133 @@ def ler_estrutura(user_id: int, bundle_id=None) -> dict:
     except Exception as e:  # noqa: BLE001
         out["erro"] = f"{type(e).__name__}: {str(e)[:250]}"
     return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NÍVEIS (até 3) — o que a tela da Shopee mostra e o modelo antigo não tinha
+#
+# Semântica por tipo, conforme o Seller Center:
+#   rule_type 2 (percentual): "Compre N itens e ganhe X %OFF"
+#   rule_type 3 (quantidade): "Compre N itens e ganhe R$ X de desconto"
+#   rule_type 1 (preço fixo): "Leve N, pague R$ X"
+#
+# RESSALVA HONESTA: a documentação pública descreve UMA regra por combo, mas a
+# tela mostra até 3 níveis. `enviar_com_niveis` TENTA o formato em lista e, se a
+# Shopee recusar, cai para o plano B (um combo por nível) — e registra qual
+# caminho funcionou, para fixarmos o certo depois do primeiro teste real.
+# ═══════════════════════════════════════════════════════════════════════════
+MAX_NIVEIS = 3
+_FORMATO_OK: dict = {}      # user_id -> formato que a Shopee aceitou
+
+
+def validar_niveis(rule_type: int, niveis: list) -> list:
+    """Valida os níveis e devolve a lista de erros legíveis (vazia = tudo certo)."""
+    erros = []
+    if not niveis:
+        return ["defina ao menos 1 nível"]
+    if len(niveis) > MAX_NIVEIS:
+        erros.append(f"a Shopee aceita no máximo {MAX_NIVEIS} níveis")
+    vistos = set()
+    anterior_min = 0
+    for i, n in enumerate(niveis, 1):
+        m = int(n.get("min") or 0)
+        v = float(n.get("valor") or 0)
+        if m < 2:
+            erros.append(f"nível {i}: o mínimo é 2 itens")
+        if m in vistos:
+            erros.append(f"nível {i}: quantidade {m} repetida")
+        vistos.add(m)
+        if m <= anterior_min:
+            erros.append(f"nível {i}: a quantidade deve crescer a cada nível")
+        anterior_min = max(anterior_min, m)
+        if rule_type == 2 and not (0 < v < 100):
+            erros.append(f"nível {i}: o percentual deve ficar entre 1 e 99")
+        if rule_type in (1, 3) and v <= 0:
+            erros.append(f"nível {i}: informe um valor em reais maior que zero")
+    return erros
+
+
+def _regra_de_nivel(rule_type: int, n: dict) -> dict:
+    return montar_regra(rule_type, float(n.get("valor") or 0), int(n.get("min") or 2),
+                        int(n.get("limite") or 0))
+
+
+def enviar_com_niveis(user_id: int, nome: str, inicio: int, fim: int, rule_type: int,
+                      niveis: list, item_ids: list, limite_compra: int = 0) -> dict:
+    """Cria o combo com N níveis. Tenta o formato em lista; se a Shopee recusar,
+    cria um combo por nível (plano B) — o resultado para o comprador é o mesmo."""
+    ordenados = sorted(niveis, key=lambda x: int(x.get("min") or 0))
+    base = {"name": str(nome)[:25], "start_time": int(inicio), "end_time": int(fim)}
+
+    # ── Plano A: lista de regras num único combo ──
+    if _FORMATO_OK.get(user_id) != "separados":
+        corpo = dict(base)
+        corpo["bundle_deal_rule_list"] = [_regra_de_nivel(rule_type, n) for n in ordenados]
+        if limite_compra:
+            corpo["purchase_limit"] = int(limite_compra)
+        try:
+            r = shopee._chamar(user_id, "/api/v2/bundle_deal/add_bundle_deal",
+                               metodo="POST", extra=corpo)
+            bid = (r.get("response") or {}).get("bundle_deal_id")
+            if bid:
+                _FORMATO_OK[user_id] = "lista"
+                add = adicionar_itens(user_id, bid, item_ids) if item_ids else {"adicionados": 0}
+                return {"ok": True, "formato": "lista", "bundles": [bid],
+                        "niveis": len(ordenados), "itens_adicionados": add.get("adicionados", 0),
+                        "corpo": corpo}
+        except Exception as e:  # noqa: BLE001
+            print(f"[bundle] formato em lista recusado ({str(e)[:120]}) — indo para o plano B", flush=True)
+
+    # ── Plano B: um combo por nível ──
+    criados, erros = [], []
+    for i, n in enumerate(ordenados, 1):
+        corpo = dict(base)
+        corpo["name"] = f"{str(nome)[:20]} N{i}"[:25]
+        corpo["bundle_deal_rule"] = _regra_de_nivel(rule_type, n)
+        if limite_compra:
+            corpo["purchase_limit"] = int(limite_compra)
+        try:
+            r = shopee._chamar(user_id, "/api/v2/bundle_deal/add_bundle_deal",
+                               metodo="POST", extra=corpo)
+            bid = (r.get("response") or {}).get("bundle_deal_id")
+            if bid:
+                criados.append(bid)
+                if item_ids:
+                    adicionar_itens(user_id, bid, item_ids)
+        except Exception as e:  # noqa: BLE001
+            erros.append({"nivel": i, "erro": str(e)[:180]})
+    if criados:
+        _FORMATO_OK[user_id] = "separados"
+    return {"ok": bool(criados), "formato": "separados", "bundles": criados,
+            "niveis": len(criados), "erros": erros,
+            "aviso": "a Shopee não aceitou níveis num combo só — criamos um combo por nível"}
+
+
+def criar_com_niveis(user_id: int, dados: dict) -> dict:
+    """Entrada única da tela: valida tudo antes de tocar na API."""
+    import time as _t
+    agora = int(_t.time())
+    nome = (dados.get("nome") or "").strip()
+    inicio = int(dados.get("inicio") or 0)
+    fim = int(dados.get("fim") or 0)
+    rule_type = int(dados.get("rule_type") or 2)
+    niveis = dados.get("niveis") or []
+    itens = [int(i) for i in (dados.get("item_ids") or []) if i]
+
+    erros = []
+    if not nome or len(nome) > 25:
+        erros.append("o nome precisa ter de 1 a 25 caracteres")
+    if inicio <= agora + 3600:
+        erros.append("o início precisa ser pelo menos 1 hora no futuro")
+    if fim <= inicio:
+        erros.append("o fim precisa ser depois do início")
+    if (fim - inicio) > 180 * 86400:
+        erros.append("a duração máxima é de 180 dias")
+    if not itens:
+        erros.append("escolha ao menos 1 produto (o ideal são 2 ou mais)")
+    erros += validar_niveis(rule_type, niveis)
+    if erros:
+        return {"ok": False, "erros": erros}
+
+    return enviar_com_niveis(user_id, nome, inicio, fim, rule_type, niveis, itens,
+                             int(dados.get("limite_compra") or 0))
