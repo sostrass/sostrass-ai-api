@@ -331,3 +331,102 @@ def diagnostico_cobertura(db, user_id: int) -> dict:
         "leitura": (f"{len(pend)} pendentes em {len(por_item)} produtos · "
                     f"{faixas['mais de 180 dias']} com mais de 180 dias"),
     }
+
+
+def diagnostico_api(user_id: int, item_id=None) -> dict:
+    """MEDE o que a API realmente devolve, em vez de deduzir.
+
+    Responde três perguntas que decidem tudo:
+      1. Quantos produtos a listagem devolve, por status?
+      2. Paginando UM produto até o fim, quantas avaliações vêm e de que datas?
+      3. Existe um limite de idade? (a avaliação mais antiga alcançável)
+    """
+    from datetime import datetime as _dt
+    from . import shopee as _sh
+    out = {"passos": [], "produtos_por_status": {}, "amostra_item": {}}
+
+    # 1) produtos por status
+    total_ids = set()
+    for st in ("NORMAL", "UNLIST", "BANNED", "DELETED"):
+        n, offset, erro = 0, 0, None
+        try:
+            for _ in range(60):
+                r = _sh._chamar(user_id, "/api/v2/product/get_item_list",
+                                extra={"offset": offset, "page_size": 100, "item_status": st})
+                resp = r.get("response") or {}
+                lote = resp.get("item") or []
+                n += len(lote)
+                for x in lote:
+                    if x.get("item_id"):
+                        total_ids.add(int(x["item_id"]))
+                offset += len(lote)
+                if not resp.get("has_next_page") or not lote:
+                    break
+        except Exception as e:  # noqa: BLE001
+            erro = str(e)[:180]
+        out["produtos_por_status"][st] = {"produtos": n, "erro": erro}
+    out["produtos_unicos"] = len(total_ids)
+    out["passos"].append(f"1) produtos: {len(total_ids)} únicos em 4 status")
+
+    # 2) um produto, paginado até o fim — mostra datas e onde para
+    alvo = int(item_id) if item_id else (sorted(total_ids)[0] if total_ids else None)
+    if alvo:
+        datas, paginas, cursor, erro = [], 0, "", None
+        try:
+            while paginas < 30:
+                r = _sh.comentarios_brutos(user_id, item_id=alvo, status="UNANSWERED",
+                                           cursor=cursor, limite=100)
+                paginas += 1
+                lote = r.get("item_comment_list") or []
+                datas += [c.get("create_time") for c in lote if c.get("create_time")]
+                if not r.get("more") or not r.get("next_cursor"):
+                    break
+                cursor = r.get("next_cursor")
+        except Exception as e:  # noqa: BLE001
+            erro = str(e)[:200]
+        if datas:
+            out["amostra_item"] = {
+                "item_id": alvo, "paginas_lidas": paginas, "avaliacoes": len(datas),
+                "mais_nova": _dt.utcfromtimestamp(max(datas)).isoformat(),
+                "mais_antiga": _dt.utcfromtimestamp(min(datas)).isoformat(),
+                "idade_maxima_dias": round((_dt.utcnow().timestamp() - min(datas)) / 86400, 1),
+                "erro": erro,
+            }
+        else:
+            out["amostra_item"] = {"item_id": alvo, "paginas_lidas": paginas,
+                                   "avaliacoes": 0, "erro": erro,
+                                   "obs": "produto sem avaliação pendente"}
+    out["passos"].append(f"2) amostra do item {alvo}: {out['amostra_item'].get('avaliacoes', 0)} pendentes")
+
+    # 3) varredura GLOBAL até onde o cursor deixa — revela o teto de idade
+    datas_g, paginas_g, cursor_g, erro_g = [], 0, "", None
+    try:
+        while paginas_g < 40:
+            r = _sh.comentarios_brutos(user_id, status="UNANSWERED", cursor=cursor_g, limite=100)
+            paginas_g += 1
+            lote = r.get("item_comment_list") or []
+            datas_g += [c.get("create_time") for c in lote if c.get("create_time")]
+            if not r.get("more") or not r.get("next_cursor"):
+                break
+            cursor_g = r.get("next_cursor")
+    except Exception as e:  # noqa: BLE001
+        erro_g = str(e)[:200]
+    if datas_g:
+        idade = round((_dt.utcnow().timestamp() - min(datas_g)) / 86400, 1)
+        out["global"] = {
+            "paginas_lidas": paginas_g, "avaliacoes": len(datas_g),
+            "mais_antiga": _dt.utcfromtimestamp(min(datas_g)).isoformat(),
+            "idade_maxima_dias": idade, "parou_por": ("fim do cursor" if paginas_g < 40 else "teto de 40 páginas"),
+            "erro": erro_g,
+        }
+        out["passos"].append(f"3) varredura global: {len(datas_g)} pendentes, a mais antiga com {idade} dias")
+        out["veredito"] = (
+            f"a API devolve até {idade} dias de idade. "
+            + ("Se o Seller Center mostra avaliações MAIS ANTIGAS que isso, a API tem limite de janela "
+               "e essas só são respondíveis pelo painel da Shopee."
+               if idade < 400 else
+               "A API alcança avaliações antigas — o problema está na nossa varredura."))
+    else:
+        out["global"] = {"avaliacoes": 0, "erro": erro_g}
+        out["veredito"] = "a varredura global não devolveu nada — ver o erro acima"
+    return out

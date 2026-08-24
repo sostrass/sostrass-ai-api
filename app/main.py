@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v6.6 — boot OK · varredura profunda em todos os status · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v6.7 — boot OK · diagnóstico do teto da API de avaliações · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -4325,6 +4325,18 @@ def shopee_cache_estado(user: User = Depends(auth.get_current_user)):
         db.close()
 
 
+@app.get("/api/shopee/avaliacoes/_diag_api")
+def aval_diag_api(item_id: str = "", user: User = Depends(auth.get_current_user)):
+    """MEDE o que a API da Shopee realmente devolve: produtos por status, um item
+    paginado até o fim e o teto de idade das avaliações alcançáveis."""
+    from . import shopee_avaliacoes as av
+    try:
+        return av.diagnostico_api(user.id, item_id or None)
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        return {"erro": f"{type(e).__name__}: {str(e)[:220]}", "trace": traceback.format_exc()[-400:]}
+
+
 @app.get("/api/shopee/avaliacoes/cobertura")
 def aval_cobertura(user: User = Depends(auth.get_current_user)):
     """Onde estão as pendentes: por idade e por produto. Confirma se a varredura pegou tudo."""
@@ -4550,7 +4562,7 @@ def bundle_encerrar(bundle_id: int, user: User = Depends(auth.get_current_user))
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v6.6", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v6.7", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
