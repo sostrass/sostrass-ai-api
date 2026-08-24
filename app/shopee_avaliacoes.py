@@ -62,7 +62,7 @@ def _gravar(db, user_id: int, c: dict) -> ShopeeAvaliacaoCache:
     return linha
 
 
-def varrer_pendentes(db, user_id: int, max_paginas: int = 15) -> dict:
+def varrer_pendentes(db, user_id: int, max_paginas: int = 30) -> dict:
     """Busca APENAS as não respondidas (comment_status=UNANSWERED) e grava no cache.
     Poucas páginas bastam: o normal é ter dezenas pendentes, não milhares."""
     chamadas = novas = 0
@@ -215,19 +215,33 @@ def varredura_profunda(db, user_id: int, item_ids: list = None,
     import time as _t
 
     ids = [int(i) for i in (item_ids or []) if i]
-    if not ids:   # sem lista explícita, pega o catálogo da loja
-        try:
-            cursor, ids = "", []
-            for _ in range(60):
-                r = _sh._chamar(user_id, "/api/v2/product/get_item_list",
-                                extra={"offset": len(ids), "page_size": 100,
-                                       "item_status": "NORMAL"})
-                lote = ((r.get("response") or {}).get("item") or [])
-                ids += [int(x.get("item_id")) for x in lote if x.get("item_id")]
-                if not (r.get("response") or {}).get("has_next_page"):
-                    break
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "erro": f"não consegui listar os produtos: {str(e)[:200]}"}
+    if not ids:
+        # TODOS os status: avaliação antiga quase sempre está em produto que hoje
+        # está DESATIVADO ou ESGOTADO. Varrer só NORMAL deixava essas de fora —
+        # era a causa das ~1.000 antigas que nunca apareciam.
+        vistos_ids = set()
+        for st in ("NORMAL", "UNLIST", "BANNED", "DELETED"):
+            try:
+                offset = 0
+                for _ in range(60):
+                    r = _sh._chamar(user_id, "/api/v2/product/get_item_list",
+                                    extra={"offset": offset, "page_size": 100,
+                                           "item_status": st})
+                    resp = r.get("response") or {}
+                    lote = resp.get("item") or []
+                    novos = [int(x.get("item_id")) for x in lote if x.get("item_id")]
+                    for n in novos:
+                        if n not in vistos_ids:
+                            vistos_ids.add(n)
+                            ids.append(n)
+                    offset += len(lote)
+                    if not resp.get("has_next_page") or not lote:
+                        break
+            except Exception as e:  # noqa: BLE001
+                print(f"[profunda] status {st}: {str(e)[:110]}", flush=True)
+        if not ids:
+            return {"ok": False, "erro": "não consegui listar nenhum produto da loja"}
+        print(f"[profunda] {len(ids)} produtos em todos os status", flush=True)
 
     ids = ids[:max_produtos]
     _PROG_PROFUNDA[user_id] = {"em_andamento": True, "total": len(ids), "feitos": 0,
@@ -238,14 +252,25 @@ def varredura_profunda(db, user_id: int, item_ids: list = None,
                    .filter(ShopeeAvaliacaoCache.user_id == user_id).all()}
     for n, iid in enumerate(ids, 1):
         try:
-            r = _sh.comentarios_brutos(user_id, item_id=iid, status="UNANSWERED", limite=100)
-            chamadas += 1
-            for c in (r.get("item_comment_list") or []):
-                cid = str(c.get("comment_id") or "")
-                _gravar(db, user_id, c)
-                if cid and cid not in ja_no_cache:
-                    achadas += 1
-                    ja_no_cache.add(cid)
+            # PAGINA dentro do produto: um item campeão pode ter centenas de
+            # avaliações antigas — pegar só as 100 primeiras perdia o resto.
+            cursor_i, paginas = "", 0
+            while paginas < 20:
+                r = _sh.comentarios_brutos(user_id, item_id=iid, status="UNANSWERED",
+                                           cursor=cursor_i, limite=100)
+                chamadas += 1
+                paginas += 1
+                lote = r.get("item_comment_list") or []
+                for c in lote:
+                    cid = str(c.get("comment_id") or "")
+                    _gravar(db, user_id, c)
+                    if cid and cid not in ja_no_cache:
+                        achadas += 1
+                        ja_no_cache.add(cid)
+                if not r.get("more") or not r.get("next_cursor"):
+                    break
+                cursor_i = r.get("next_cursor")
+                _t.sleep(0.08)
             if n % 25 == 0:
                 db.commit()
         except Exception as e:  # noqa: BLE001
@@ -258,3 +283,51 @@ def varredura_profunda(db, user_id: int, item_ids: list = None,
     return {"ok": True, "produtos_varridos": len(ids), "chamadas_api": chamadas,
             "avaliacoes_novas": achadas, "pendentes_agora": pendentes_qtd(db, user_id),
             "aviso": "carga única — o que foi encontrado fica no cache e não é buscado de novo"}
+
+
+def diagnostico_cobertura(db, user_id: int) -> dict:
+    """Mostra ONDE estão as pendentes: por produto, por idade e o que ainda falta
+    varrer. É como se confirma que a varredura profunda alcançou tudo."""
+    from collections import Counter
+    from datetime import datetime as _dt
+    base = db.query(ShopeeAvaliacaoCache).filter(ShopeeAvaliacaoCache.user_id == user_id)
+    pend = base.filter(ShopeeAvaliacaoCache.respondida == False).all()  # noqa: E712
+    agora = int(_dt.utcnow().timestamp())
+
+    faixas = {"até 7 dias": 0, "8 a 30 dias": 0, "31 a 90 dias": 0,
+              "91 a 180 dias": 0, "mais de 180 dias": 0, "sem data": 0}
+    for a in pend:
+        ct = a.create_time or 0
+        if not ct:
+            faixas["sem data"] += 1
+            continue
+        dias = (agora - ct) / 86400
+        if dias <= 7:
+            faixas["até 7 dias"] += 1
+        elif dias <= 30:
+            faixas["8 a 30 dias"] += 1
+        elif dias <= 90:
+            faixas["31 a 90 dias"] += 1
+        elif dias <= 180:
+            faixas["91 a 180 dias"] += 1
+        else:
+            faixas["mais de 180 dias"] += 1
+
+    por_item = Counter(a.item_id for a in pend if a.item_id)
+    mais_antiga = min((a.create_time for a in pend if a.create_time), default=None)
+    mais_nova = max((a.create_time for a in pend if a.create_time), default=None)
+    return {
+        "pendentes": len(pend),
+        "respondidas": base.filter(ShopeeAvaliacaoCache.respondida == True).count(),  # noqa: E712
+        "total_no_cache": base.count(),
+        "travadas_por_falha": base.filter(
+            ShopeeAvaliacaoCache.respondida == False,  # noqa: E712
+            ShopeeAvaliacaoCache.tentativas >= MAX_TENTATIVAS).count(),
+        "por_idade": faixas,
+        "produtos_com_pendencia": len(por_item),
+        "top_produtos": [{"item_id": i, "pendentes": n} for i, n in por_item.most_common(10)],
+        "mais_antiga": (_dt.utcfromtimestamp(mais_antiga).isoformat() if mais_antiga else None),
+        "mais_nova": (_dt.utcfromtimestamp(mais_nova).isoformat() if mais_nova else None),
+        "leitura": (f"{len(pend)} pendentes em {len(por_item)} produtos · "
+                    f"{faixas['mais de 180 dias']} com mais de 180 dias"),
+    }

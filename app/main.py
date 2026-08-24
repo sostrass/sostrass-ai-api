@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v6.5 — boot OK · bundle com níveis + termômetro de campanhas · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v6.6 — boot OK · varredura profunda em todos os status · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -4325,6 +4325,17 @@ def shopee_cache_estado(user: User = Depends(auth.get_current_user)):
         db.close()
 
 
+@app.get("/api/shopee/avaliacoes/cobertura")
+def aval_cobertura(user: User = Depends(auth.get_current_user)):
+    """Onde estão as pendentes: por idade e por produto. Confirma se a varredura pegou tudo."""
+    from . import shopee_avaliacoes as av
+    db = SessionLocal()
+    try:
+        return av.diagnostico_cobertura(db, user.id)
+    finally:
+        db.close()
+
+
 @app.post("/api/shopee/avaliacoes/profunda")
 def aval_profunda(payload: dict = Body(default={}), tarefas: BackgroundTasks = None,
                   user: User = Depends(auth.get_current_user)):
@@ -4539,7 +4550,7 @@ def bundle_encerrar(bundle_id: int, user: User = Depends(auth.get_current_user))
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v6.5", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v6.6", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
