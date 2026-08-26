@@ -38,6 +38,22 @@ def garantir_colunas_extras():
     """Adiciona colunas novas em tabelas já existentes de forma idempotente (Postgres e SQLite),
     sem depender de uma migration Alembic manual. Seguro rodar a cada boot."""
     from sqlalchemy import inspect, text
+    # ── Tabelas que o create_all geral pode ter PULADO ─────────────────────────
+    # O create_all do boot roda dentro de try/except: pass. Se UMA tabela falha na
+    # criação, o create_all estoura e as SEGUINTES nem chegam a ser criadas — foi o
+    # que aconteceu com `shopee_avaliacao_cache` (a varredura de avaliações gravava
+    # numa tabela inexistente e explodia). Aqui garantimos as críticas isoladamente:
+    # cada uma no seu try, checkfirst=True (não toca no que já existe) e com LOG —
+    # nada de engolir erro em silêncio.
+    try:
+        from . import models as _m
+        for _nome in ("ShopeeAvaliacaoCache",):
+            _cls = getattr(_m, _nome, None)
+            if _cls is not None:
+                _cls.__table__.create(bind=engine, checkfirst=True)
+        print("[precifica] tabelas extras verificadas · shopee_avaliacao_cache OK", flush=True)
+    except Exception as _e:  # noqa: BLE001 — logamos em vez de engolir
+        print(f"[precifica] garantir_tabelas_extras FALHOU: {_e}", flush=True)
     insp = inspect(engine)
     alvos = {
         "shopee_boost_config": [
