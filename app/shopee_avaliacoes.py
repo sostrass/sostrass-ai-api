@@ -430,3 +430,63 @@ def diagnostico_api(user_id: int, item_id=None) -> dict:
         out["global"] = {"avaliacoes": 0, "erro": erro_g}
         out["veredito"] = "a varredura global não devolveu nada — ver o erro acima"
     return out
+
+
+def sla_resposta(db, user_id: int) -> dict:
+    """Velocidade de resposta a partir do cache. Usa o horário REAL da resposta
+    (comment_reply.create_time no payload cru) menos o create_time da avaliação.
+    Só entram avaliações com os dois tempos — nada de estimativa. `amostra` diz
+    quantas serviram; se for pequena, a tela mostra 'acumulando'."""
+    import time as _t
+    linhas = (db.query(ShopeeAvaliacaoCache)
+              .filter(ShopeeAvaliacaoCache.user_id == user_id).all())
+    deltas = []          # segundos entre avaliação e resposta
+    pend_fora = 0        # pendentes que já passaram de 48h
+    agora = int(_t.time())
+    for l in linhas:
+        ct = l.create_time or 0
+        if not l.respondida:
+            if ct and (agora - ct) > 48 * 3600:
+                pend_fora += 1
+            continue
+        pl = l.payload if isinstance(l.payload, dict) else {}
+        rt = ((pl.get("comment_reply") or {}).get("create_time")) or 0
+        if ct and rt and rt >= ct:
+            deltas.append(rt - ct)
+    deltas.sort()
+    n = len(deltas)
+
+    def _pct(p):
+        if not n:
+            return None
+        i = min(n - 1, int(round((p / 100) * (n - 1))))
+        return deltas[i]
+
+    def _fmt(s):
+        if s is None:
+            return None
+        if s < 3600:
+            return f"{max(1, round(s / 60))}min"
+        if s < 86400:
+            h = s / 3600
+            return (f"{h:.0f}h" if abs(h - round(h)) < 0.05 else f"{h:.1f}h")
+        return f"{round(s / 86400)}d"
+
+    faixas = {"<1h": 0, "1-6h": 0, "6-24h": 0, ">24h": 0}
+    for s in deltas:
+        if s < 3600:
+            faixas["<1h"] += 1
+        elif s < 6 * 3600:
+            faixas["1-6h"] += 1
+        elif s < 24 * 3600:
+            faixas["6-24h"] += 1
+        else:
+            faixas[">24h"] += 1
+    pct = {k: (round(v / n * 100) if n else 0) for k, v in faixas.items()}
+    dentro = sum(1 for s in deltas if s <= 48 * 3600)
+    return {"amostra": n,
+            "mediana_seg": _pct(50), "p90_seg": _pct(90),
+            "mediana": _fmt(_pct(50)), "p90": _fmt(_pct(90)),
+            "faixas_pct": pct, "faixas_qtd": faixas,
+            "pct_no_prazo": (round(dentro / n * 100) if n else None),
+            "pendentes_fora_prazo": pend_fora}

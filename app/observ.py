@@ -33,6 +33,53 @@ log = logging.getLogger("precifica")
 _BUFFER: deque = deque(maxlen=800)
 _instrumentado = False
 
+# ── Contador de consumo de API ──────────────────────────────────────────────
+# Agrega quantas chamadas por endpoint e por dia, por usuário. Em memória (reseta
+# a cada redeploy) — hoje é exato; a série de dias é "desde o boot". Alimenta o
+# KPI "Consumo da API" no painel. Não persiste em banco de propósito: zero risco.
+from collections import defaultdict as _dd  # noqa: E402
+import datetime as _dt  # noqa: E402
+
+_CONSUMO: dict = _dd(lambda: _dd(lambda: _dd(int)))  # [user_id][YYYY-MM-DD]["CANAL:endpoint"] = qtd
+
+
+def _contabilizar(user_id, canal: str, path: str) -> None:
+    """Incrementa o contador de uma chamada externa. À prova de falha."""
+    try:
+        dia = _dt.date.today().isoformat()
+        ep = (path or "").rstrip("/").split("/")[-1] or "?"
+        _CONSUMO[user_id or 0][dia][f"{canal}:{ep}"] += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def consumo(user_id, dias: int = 14) -> dict:
+    """Resumo de consumo p/ o painel: por endpoint hoje, série de N dias e total do mês."""
+    hoje = _dt.date.today()
+    dados = _CONSUMO.get(user_id or 0, {})
+    hoje_map = dados.get(hoje.isoformat(), {})
+    por_endpoint = {}
+    for k, v in hoje_map.items():
+        canal, ep = (k.split(":", 1) + ["?"])[:2]
+        por_endpoint.setdefault(canal, {})[ep] = v
+    serie = []
+    for i in range(max(dias, 1) - 1, -1, -1):
+        d = (hoje - _dt.timedelta(days=i)).isoformat()
+        m = dados.get(d, {})
+        serie.append({
+            "dia": d,
+            "shopee": sum(v for k, v in m.items() if k.startswith("SHOPEE:")),
+            "ml": sum(v for k, v in m.items() if k.startswith("ML:")),
+        })
+    mes = hoje.strftime("%Y-%m")
+    mes_shopee = sum(v for d, m in dados.items() if d.startswith(mes)
+                     for k, v in m.items() if k.startswith("SHOPEE:"))
+    hoje_shopee = sum(por_endpoint.get("SHOPEE", {}).values())
+    return {"hoje_shopee": hoje_shopee, "mes_shopee": mes_shopee,
+            "por_endpoint": por_endpoint.get("SHOPEE", {}),
+            "por_endpoint_ml": por_endpoint.get("ML", {}),
+            "serie": serie, "origem": "memoria_desde_boot"}
+
 
 class _BufferHandler(logging.Handler):
     def emit(self, record: logging.LogRecord):
@@ -150,6 +197,7 @@ def instrumentar() -> None:
                 _log_chamada_externa("SHOPEE", metodo, path, int((time.time() - t0) * 1000), r, _contar_itens(extra))
             except Exception:  # noqa: BLE001
                 pass
+            _contabilizar(user_id, "SHOPEE", path)
             return r
 
         _sh._chamar = _chamar_logado
@@ -185,6 +233,7 @@ def instrumentar() -> None:
                     log.info("ML %s %s (%dms) ok", metodo, path, int((time.time() - t0) * 1000))
             except Exception:  # noqa: BLE001
                 pass
+            _contabilizar(user_id, "ML", path)
             return r
 
         _ml._req = _req_logado
