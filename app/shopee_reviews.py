@@ -378,6 +378,44 @@ def parar_agente(user_id: int) -> dict:
     return {"acao": "parando"}
 
 
+def _pendentes_do_cache(user_id: int, alvos) -> list:
+    """Pendentes que JÁ estão no banco — inclui as antigas achadas pela varredura profunda,
+    que a busca global da Shopee não devolve mais. Lê do cache, SEM gastar API.
+    Reconstrói o comentário a partir do payload cru, com fallback nas colunas estruturadas."""
+    from .db import SessionLocal as _SLc
+    from .models import ShopeeAvaliacaoCache as _ACc
+    from . import shopee_avaliacoes as _avc
+    out = []
+    _d = _SLc()
+    try:
+        linhas = (_d.query(_ACc).filter(
+            _ACc.user_id == user_id,
+            _ACc.respondida == False,                       # noqa: E712
+            _ACc.tentativas < _avc.MAX_TENTATIVAS).all())
+        for l in linhas:
+            pl = l.payload if isinstance(l.payload, dict) else {}
+            if (pl.get("comment_reply") or {}).get("reply"):
+                continue
+            nota = pl.get("rating_star")
+            if nota is None:
+                nota = l.rating
+            if nota not in alvos:
+                continue
+            c = dict(pl)
+            c["comment_id"] = str(l.comment_id)
+            c["rating_star"] = nota
+            if not c.get("comment"):
+                c["comment"] = l.comentario or ""
+            if not c.get("buyer_username"):
+                c["buyer_username"] = l.comprador or ""
+            if not c.get("item_id") and l.item_id:
+                c["item_id"] = l.item_id
+            out.append(c)
+    finally:
+        _d.close()
+    return out
+
+
 def iniciar_mutirao(user_id: int, completo: bool = False) -> dict:
     """Dispara o agente para responder TODA a fila pendente (notas-alvo), em uma thread
     de fundo, com pausa entre cada resposta e progresso ao vivo. Não bloqueia a requisição.
@@ -494,6 +532,20 @@ def _rodar_mutirao(user_id: int, completo: bool = False):
                     _set_prog(user_id, fase="varrendo_produtos", alvo=len(pendentes),
                               prod_atual=idx + 1, prod_total=total_prod)
                 time.sleep(0.06)  # respeita o limite de chamadas da Shopee
+
+        # FASE 1c — PENDENTES JÁ NO CACHE. Inclui as antigas que a varredura profunda achou e
+        # que a busca global não devolve mais. Sem gastar API. Era o elo que faltava: o mutirão
+        # não lia o banco, então as antigas do cache nunca entravam na fila de resposta.
+        try:
+            for c in _pendentes_do_cache(user_id, alvos):
+                cid = c.get("comment_id")
+                if cid in vistos:
+                    continue
+                vistos.add(cid)
+                pendentes.append(c)
+            _set_prog(user_id, fase="descobrindo", alvo=len(pendentes))
+        except Exception:  # noqa: BLE001
+            pass
 
         # enriquece a fila com nome do produto, em lotes (para o prompt da IA)
         try:
@@ -617,6 +669,17 @@ def auto_responder(user_id: int, limite: int = 100) -> dict:
     # fila real deste ciclo: sem resposta, nota dentro do alvo, respeitando o teto
     fila = [c for c in comentarios
             if not (c.get("comment_reply") or {}).get("reply") and c.get("rating_star") in alvos]
+    # inclui as pendentes JÁ no banco (antigas achadas pela varredura profunda). A busca global
+    # acima só traz as recentes; sem isto o modo automático nunca respondia as antigas do cache.
+    try:
+        _vistos_af = {str(c.get("comment_id")) for c in fila}
+        for _c in _pendentes_do_cache(user_id, alvos):
+            _cid = str(_c.get("comment_id"))
+            if _cid not in _vistos_af:
+                _vistos_af.add(_cid)
+                fila.append(_c)
+    except Exception:  # noqa: BLE001
+        pass
     alvo = min(len(fila), max_ciclo)
     ignorados = sum(1 for c in comentarios
                     if not (c.get("comment_reply") or {}).get("reply") and c.get("rating_star") not in alvos)
@@ -638,14 +701,30 @@ def auto_responder(user_id: int, limite: int = 100) -> dict:
                     continue
                 shopee.responder_avaliacao(user_id, c.get("comment_id"), texto)
                 respondidos += 1
+                try:   # marca no cache: sai da fila de vez (não reaparece no próximo ciclo)
+                    from .db import SessionLocal as _SLam
+                    from . import shopee_avaliacoes as _avam
+                    _dam = _SLam()
+                    try: _avam.marcar_respondida(_dam, user_id, c.get("comment_id"), texto)
+                    finally: _dam.close()
+                except Exception:  # noqa: BLE001
+                    pass
                 _registrar_log(user_id, c.get("comment_id"), nota, buyer, produto, texto, "auto")
                 _set_prog(user_id, processados=respondidos,
                           ultimo={"nota": nota, "buyer": buyer, "produto": produto,
                                   "quando": datetime.utcnow().isoformat()})
                 if pausa:                   # espaça as chamadas pra não floodar a API da Shopee
                     time.sleep(pausa)
-            except Exception:  # noqa: BLE001 — um erro num comentário não derruba o lote
+            except Exception as _eaf:  # noqa: BLE001 — um erro num comentário não derruba o lote
                 falhas += 1
+                try:   # conta a tentativa; após MAX, aquela avaliação sai da fila do cache
+                    from .db import SessionLocal as _SLaf
+                    from . import shopee_avaliacoes as _avaf
+                    _daf = _SLaf()
+                    try: _avaf.marcar_falha(_daf, user_id, c.get("comment_id"), str(_eaf))
+                    finally: _daf.close()
+                except Exception:  # noqa: BLE001
+                    pass
                 continue
     finally:
         _set_prog(user_id, em_andamento=False, fim=datetime.utcnow().isoformat())
