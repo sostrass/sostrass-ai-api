@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         observ.instrumentar()
     except Exception:  # noqa: BLE001 — observabilidade NUNCA pode impedir o boot
         pass
-    print("[precifica] backend v6.7.3 — boot OK · mutirão/automático agora respondem pendentes do cache (antigas) · KPIs reputação · leitura do banco + varredura de fundo", flush=True)
+    print("[precifica] backend v6.7.5 — boot OK · boost: endpoint estender (+4h) · seletor cache-first · fix cache avaliacoes · leitura do banco + varredura de fundo", flush=True)
     run_migrations()
     # garante tabelas aditivas — não mexe nas existentes
     # Cria TODAS as tabelas faltantes (checkfirst não toca nas que já existem). Robusto:
@@ -611,6 +611,67 @@ def shopee_desempenho(user: User = Depends(auth.get_current_user)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.get("/api/shopee/boost/produtos")
+def shopee_boost_produtos(q: str = "", ordem: str = "vendas", filtro: str = "todos",
+                          offset: int = 0, limite: int = 50,
+                          user: User = Depends(auth.get_current_user)):
+    """Catálogo local (ShopeeItemCache) para o seletor do Boost: busca, ordenação e filtros
+    NO SERVIDOR, com giro de 30d. Rápido — lê do banco, não da API da Shopee a cada página.
+    Assim produtos novos (já sincronizados) aparecem na busca em vez de ficarem presos numa
+    página não carregada."""
+    from .models import ShopeeItemCache, ShopeeBoostItem
+    db = SessionLocal()
+    try:
+        cache = db.query(ShopeeItemCache).filter(ShopeeItemCache.user_id == user.id).all()
+        na_fila = {str(r[0]) for r in db.query(ShopeeBoostItem.item_id)
+                   .filter(ShopeeBoostItem.user_id == user.id).all()}
+        try:
+            vendas = shopee.vendas_por_item(user.id, dias=30)   # cacheado ~30min
+        except Exception:  # noqa: BLE001
+            vendas = {}
+        vmap = {str(k): int(v) for k, v in (vendas or {}).items()}
+        ql = (q or "").strip().lower()
+        linhas = []
+        for it in cache:
+            iid = str(it.item_id)
+            nome = it.nome or f"#{iid}"
+            sku = it.sku or ""
+            if ql and ql not in nome.lower() and ql not in sku.lower():
+                continue
+            emfila = iid in na_fila
+            if filtro == "fora_boost" and emfila:
+                continue
+            if filtro == "promo" and not it.em_promocao:
+                continue
+            linhas.append({
+                "item_id": iid, "nome": nome, "sku": it.sku, "preco": it.preco,
+                "em_promocao": bool(it.em_promocao), "promo_nome": it.promo_nome,
+                "imagem": it.imagem, "status": it.status, "vendas": vmap.get(iid, 0),
+                "na_fila": emfila,
+                "atualizado_em": it.atualizado_em.isoformat() if it.atualizado_em else "",
+            })
+        if ordem == "az":
+            linhas.sort(key=lambda x: (x["nome"] or "").lower())
+        elif ordem == "za":
+            linhas.sort(key=lambda x: (x["nome"] or "").lower(), reverse=True)
+        elif ordem == "preco_asc":
+            linhas.sort(key=lambda x: x["preco"] or 0)
+        elif ordem == "preco_desc":
+            linhas.sort(key=lambda x: x["preco"] or 0, reverse=True)
+        elif ordem == "recentes":
+            linhas.sort(key=lambda x: x["atualizado_em"] or "", reverse=True)
+        else:   # vendas (padrão) — mais vendidos primeiro
+            linhas.sort(key=lambda x: x["vendas"], reverse=True)
+        total = len(linhas)
+        page = linhas[offset:offset + max(1, min(limite, 100))]
+        return {"itens": page, "total": total, "offset": offset,
+                "tem_mais": (offset + len(page)) < total,
+                "na_fila_total": len(na_fila), "catalogo_total": len(cache),
+                "cache_vazio": len(cache) == 0}
+    finally:
+        db.close()
+
+
 # ---- Boost (auto-impulsionamento rotativo) ----
 @app.get("/api/shopee/boost/status")
 def shopee_boost_status(user: User = Depends(auth.get_current_user)):
@@ -764,6 +825,22 @@ def shopee_boost_reordenar(payload: dict = Body(...), user: User = Depends(auth.
         return {"ok": True, "criterio": "prioridade"}
     finally:
         db.close()
+
+
+@app.post("/api/shopee/boost/itens/{item_id}/estender")
+def shopee_boost_estender(item_id: str, user: User = Depends(auth.get_current_user)):
+    """Re-impulsiona o item, renovando as 4h de destaque (boost_item da Shopee)."""
+    try:
+        shopee.impulsionar(user.id, [item_id])
+    except shopee.ShopeeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    try:
+        import datetime as _dt
+        _ini = _dt.datetime.utcnow()
+        shopee_boost._log_boost(user.id, str(item_id), None, "manual", _ini, _ini + _dt.timedelta(hours=4))
+    except Exception:  # noqa: BLE001 — histórico nunca derruba a ação
+        pass
+    return {"ok": True, "item_id": str(item_id)}
 
 
 @app.post("/api/shopee/boost/rodar")
@@ -4581,7 +4658,7 @@ def bundle_encerrar(bundle_id: int, user: User = Depends(auth.get_current_user))
 @app.get("/api/versao")
 def versao_backend():
     """Aberto: confirma qual backend está no ar sem depender de logs."""
-    return {"backend": "v6.7.3", "arquitetura": "banco+varredura", "ts": _time.time()}
+    return {"backend": "v6.7.5", "arquitetura": "banco+varredura", "ts": _time.time()}
 
 
 @app.get("/api/mercadolivre/pedidos-enriquecido")
